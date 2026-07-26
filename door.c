@@ -46,7 +46,12 @@
  * matches path, and the operation's permission bit is set. Patterns are stored
  * unescaped; the wild bitmaps mark which positions are '?'/'*' wildcards, so a
  * literal '*' or '?' byte (escaped in JSON) has its bit clear. An empty
- * pattern (leading NUL, bit 0 clear) always matches. */
+ * pattern (leading NUL, bit 0 clear) always matches.
+ *
+ * A pattern whose first byte is a wildcard '*' is a suffix match. The loader
+ * fills the matching *_suffix_len with the number of pattern bytes after that
+ * '*', which is what lets the matcher jump straight to the path's tail instead
+ * of backtracking. It is 0 for prefix and empty patterns. */
 struct rule {
     char exec_path[PATH_LEN];
     char path[PATH_LEN];
@@ -56,6 +61,9 @@ struct rule {
     __u8 permission;
     __u8 deny;
     __u8 no_event;
+    __u8 exec_suffix_len;
+    __u8 path_suffix_len;
+    __u8 _pad[2];
 };
 
 struct policy_meta {
@@ -197,6 +205,7 @@ struct path_match_ctx {
     const char *rule;
     const __u8 *wild;
     const char *path;
+    __u32 start; /* suffix match: path offset the comparison starts at */
     __u8 matched;
 };
 
@@ -224,6 +233,35 @@ static long match_path_cb(__u32 i, void *data)
     return rc != pc;
 }
 
+/* Suffix matcher for patterns that lead with a wildcard '*'. The wildcard's
+ * span is fixed rather than searched — the loader supplies the suffix length,
+ * so the comparison simply starts at path_len - suffix_len and walks forward,
+ * keeping this the same single scan as the prefix case. Pattern index i + 1
+ * skips the leading '*'; ctx->start is bounded by the caller so every path
+ * index stays inside PATH_LEN. */
+static long match_suffix_cb(__u32 i, void *data)
+{
+    struct path_match_ctx *ctx = data;
+    __u32 ri = i + 1, pi = ctx->start + i;
+    char rc, pc;
+    __u8 w;
+
+    if (ri >= PATH_LEN) return 1;
+    barrier_var(ri);
+    rc = ctx->rule[ri];
+    if (rc == '\0') {           /* the whole suffix compared equal */
+        ctx->matched = 1;
+        return 1;
+    }
+    if (pi >= PATH_LEN) return 1;
+    barrier_var(pi);
+    pc = ctx->path[pi];
+    w = ctx->wild[ri >> 3] & (1 << (ri & 7));
+
+    if (w && rc == '?') return pc == '\0';
+    return rc != pc;
+}
+
 /* A leading NUL with its wild bit clear is the "always matches any path"
  * pattern. Patterns must be NUL-terminated within PATH_LEN by the loader; a
  * pattern that fills all PATH_LEN bytes without a NUL never sets matched below,
@@ -233,8 +271,16 @@ static __always_inline int pattern_is_empty(const char *pattern, const __u8 *wil
     return pattern[0] == '\0' && !(wild[0] & 1);
 }
 
+/* A wildcard '*' in position 0 anchors the pattern to the path's tail. An
+ * escaped literal '*' has its wild bit clear and is not a suffix pattern. */
+static __always_inline int pattern_is_suffix(const char *pattern, const __u8 *wild)
+{
+    return pattern[0] == '*' && (wild[0] & 1);
+}
+
 static __always_inline int match_path_pattern(const char *pattern, const __u8 *wild,
-                                              const char *path)
+                                              __u8 suffix_len, const char *path,
+                                              __u32 path_len)
 {
     struct path_match_ctx ctx = {
         .rule = pattern,
@@ -243,6 +289,17 @@ static __always_inline int match_path_pattern(const char *pattern, const __u8 *w
     };
 
     if (pattern_is_empty(pattern, wild)) return 1;
+    if (pattern_is_suffix(pattern, wild)) {
+        /* A bare "*" carries no suffix and matches like the empty pattern. */
+        if (suffix_len == 0) return 1;
+        /* Paths that did not fit PATH_LEN were truncated, so their real tail
+         * is not observable here and a suffix rule must not claim a match. */
+        if (path_len >= PATH_LEN) return 0;
+        if (suffix_len > path_len) return 0;
+        ctx.start = path_len - suffix_len;
+        bpf_loop(PATH_LEN, match_suffix_cb, &ctx, 0);
+        return ctx.matched;
+    }
     bpf_loop(PATH_LEN, match_path_cb, &ctx, 0);
     return ctx.matched;
 }
@@ -466,6 +523,10 @@ struct policy_check_ctx {
     const char *policy_id;
     __u32 uid;
     __u32 count;
+    /* strlen of the two paths, for suffix matching. A value >= PATH_LEN means
+     * the path did not fit the buffer and was truncated. */
+    __u32 path_len;
+    __u32 exec_path_len;
     __u8 op;
     __u8 perm_bit;
     __u8 matched;
@@ -496,7 +557,8 @@ static long check_rule_cb(__u32 i, void *data)
     if (ctx->executable_path) {
         if (ctx->exec_resolved) {
             if (!match_path_pattern(r->exec_path, r->exec_wild,
-                                    ctx->executable_path))
+                                    r->exec_suffix_len, ctx->executable_path,
+                                    ctx->exec_path_len))
                 return 0;
         } else if (!pattern_is_empty(r->exec_path, r->exec_wild)) {
             /* The process image could not be resolved and this rule is scoped
@@ -507,7 +569,9 @@ static long check_rule_cb(__u32 i, void *data)
             if (!r->deny) return 0;
         }
     }
-    if (!match_path_pattern(r->path, r->path_wild, ctx->path)) return 0;
+    if (!match_path_pattern(r->path, r->path_wild, r->path_suffix_len, ctx->path,
+                            ctx->path_len))
+        return 0;
 
     ctx->matched = 1;
     cfg = bpf_map_lookup_elem(&runtime_config_map, &zero);
@@ -540,9 +604,9 @@ static __always_inline int task_is_exempt(void)
  * settime, mkdir, symlink, link, mknod). The first rule whose permission bit,
  * exec_path pattern (current process image) and path pattern all match
  * decides the outcome. */
-static __always_inline int check_policy(const char *path, __u8 op)
+static __always_inline int check_policy(const char *path, __u32 path_len, __u8 op)
 {
-    __u32 uid, zero = 0, count;
+    __u32 uid, zero = 0, count, exec_path_len = 0;
     struct task_struct *task;
     struct policy_slot *meta;
     struct policy_check_ctx ctx;
@@ -583,10 +647,15 @@ static __always_inline int check_policy(const char *path, __u8 op)
          * scalar from the verifier's perspective. */
         mm = task->mm;
         exe_file = mm ? mm->exe_file : 0;
-        if (exe_file &&
-            bpf_d_path(&exe_file->f_path, executable_scratch->path,
-                       sizeof(executable_scratch->path)) > 0)
-            exec_resolved = 1;
+        if (exe_file) {
+            long n = bpf_d_path(&exe_file->f_path, executable_scratch->path,
+                                sizeof(executable_scratch->path));
+
+            if (n > 0) {
+                exec_resolved = 1;
+                exec_path_len = (__u32)n - 1;   /* n counts the NUL */
+            }
+        }
     }
 
     ctx = (struct policy_check_ctx){
@@ -596,6 +665,8 @@ static __always_inline int check_policy(const char *path, __u8 op)
         .policy_id = meta->meta.id,
         .uid = uid,
         .count = count,
+        .path_len = path_len,
+        .exec_path_len = exec_path_len,
         .op = op,
         .perm_bit = op == OP_EXEC ? PERM_EXEC :
                     op == OP_READ ? PERM_READ : PERM_WRITE,
@@ -614,6 +685,7 @@ static __always_inline int check(struct file *file, __u8 op)
 {
     __u32 zero = 0;
     struct file_path_scratch *path_scratch;
+    long len;
 
     if (task_is_exempt()) {
         /* Do not retain an older pending exec event for an exempt task. */
@@ -626,12 +698,13 @@ static __always_inline int check(struct file *file, __u8 op)
     path_scratch = bpf_map_lookup_elem(&file_path_scratch, &zero);
     if (!path_scratch) return 0;
     path_scratch->path[0] = '\0';
-    if (bpf_d_path(&file->f_path, path_scratch->path, PATH_LEN) < 0) return 0;
+    len = bpf_d_path(&file->f_path, path_scratch->path, PATH_LEN);
+    if (len <= 0) return 0;
     if (op == OP_EXEC) {
         __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
         bpf_map_delete_elem(&pending_execs, &pid);
     }
-    return check_policy(path_scratch->path, op);
+    return check_policy(path_scratch->path, (__u32)len - 1, op);
 }
 
 /* Resolve "parent directory path" + "/" + "dentry name" into the shared path
@@ -667,9 +740,12 @@ static __always_inline int check_dir_dentry(const struct path *dir,
     }
     ps->path[off] = '/';
     name = BPF_CORE_READ(dentry, d_name.name);
-    if (bpf_probe_read_kernel_str(&ps->path[off + 1], PATH_LEN, name) <= 0)
-        return 0;
-    return check_policy(ps->path, op);
+    len = bpf_probe_read_kernel_str(&ps->path[off + 1], PATH_LEN, name);
+    if (len <= 0) return 0;
+    /* off + 1 leading bytes plus len - 1 component bytes. This is the one
+     * producer that can exceed PATH_LEN, which only suffix rules care about;
+     * they decline to match a path they cannot see the end of. */
+    return check_policy(ps->path, off + (__u32)len, op);
 }
 
 /* Hooks that receive the target as a struct path resolve it directly. */
@@ -677,13 +753,15 @@ static __always_inline int check_path_op(const struct path *p, __u8 op)
 {
     __u32 zero = 0;
     struct file_path_scratch *ps;
+    long len;
 
     if (task_is_exempt()) return 0;
     ps = bpf_map_lookup_elem(&file_path_scratch, &zero);
     if (!ps) return 0;
     ps->path[0] = '\0';
-    if (bpf_d_path((struct path *)p, ps->path, PATH_LEN) < 0) return 0;
-    return check_policy(ps->path, op);
+    len = bpf_d_path((struct path *)p, ps->path, PATH_LEN);
+    if (len <= 0) return 0;
+    return check_policy(ps->path, (__u32)len - 1, op);
 }
 
 /*
@@ -749,6 +827,7 @@ static __always_inline int check_dentry_op(struct dentry *dentry, __u8 op)
     struct dentry_walk_scratch *s;
     struct file_path_scratch *ps;
     struct dentry_walk_ctx ctx;
+    long len;
 
     if (task_is_exempt()) return 0;
     s = bpf_map_lookup_elem(&dentry_walk_scratch_map, &zero);
@@ -762,11 +841,12 @@ static __always_inline int check_dentry_op(struct dentry *dentry, __u8 op)
     if (ctx.pos == PATH_LEN) {                  /* dentry was the root itself */
         ps->path[0] = '/';
         ps->path[1] = '\0';
-    } else if (bpf_probe_read_kernel_str(ps->path, PATH_LEN,
-                                         &s->build[ctx.pos]) <= 0) {
+        len = 2;
+    } else if ((len = bpf_probe_read_kernel_str(ps->path, PATH_LEN,
+                                                &s->build[ctx.pos])) <= 0) {
         return 0;
     }
-    return check_policy(ps->path, op);
+    return check_policy(ps->path, (__u32)len - 1, op);
 }
 
 /*
