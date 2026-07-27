@@ -49,6 +49,7 @@
 #define OP_NET_ACCEPT  23
 #define OP_NET_CONNECT 24
 #define OP_NET_SEND    25
+#define OP_NET_INGRESS 26
 
 /* Permission bits selecting which operations a network rule governs. This is a
  * namespace of its own; it is unrelated to door.c's execute/read/write bits.
@@ -154,7 +155,11 @@ struct net_event {
      * carries it follows from the operation: bind/listen/accept are local,
      * connect/sendmsg are remote. */
     __u8 addr_valid;           /*   33 */
-    __u8 _pad[2];              /*   34 */
+    /* Set on records produced in softirq (ingress), where there is no task to
+     * attribute: pid, ppid, tty, cgroup and cmdline are left zero and must be
+     * read as "not available" rather than as a process with pid 0. */
+    __u8 no_task;              /*   34 */
+    __u8 _pad;                 /*   35 */
     __u16 local_port;          /*   36 */
     __u16 remote_port;         /*   38 */
     __u8 local_addr[16];       /*   40 */
@@ -198,6 +203,58 @@ struct net_cache_val {
     __u8 emitted; /* the event for this (socket, destination) already went out */
 };
 
+/* ---------------------------------------------------------------------------
+ * Ingress: a host-wide policy, deliberately outside the login-uid policy space.
+ *
+ * An arriving SYN has no task behind it — the hook runs in softirq, on whatever
+ * CPU the packet landed on — so there is no login uid to key on and no process
+ * to attribute. Ingress therefore gets its own single global rule array rather
+ * than the per-uid map-in-map the egress rules use.
+ *
+ * TCP only, on purpose. security_sock_rcv_skb() would be needed for UDP and
+ * ICMP, and it sits on the receive path of *every* packet including established
+ * TCP data — measured at 739k calls for a workload whose ingress decisions
+ * numbered zero. inet_conn_request() fires once per connection attempt instead,
+ * so this costs nothing once a connection is up.
+ * ------------------------------------------------------------------------- */
+struct ingress_rule {
+    __u8 src_addr[16];      /* source prefix, v4-mapped */
+    __u8 local_addr[16];    /* local (destination) prefix, v4-mapped */
+    __u8 enabled;
+    __u8 deny;
+    __u8 no_event;
+    __u8 family;            /* 0=any, AF_INET 2, AF_INET6 10 */
+    __u8 protocol;          /* 0=any, IPPROTO_TCP 6; only TCP arrives here today */
+    __u8 src_prefix_len;    /* 0..128, or NET_ANY_PREFIX */
+    __u8 local_prefix_len;
+    __u8 _pad;
+    __u16 port_min;         /* local (listening) port, host byte order */
+    __u16 port_max;
+};
+
+struct ingress_meta {
+    __u32 rule_count;
+    char id[POLICY_ID_LEN];
+};
+
+struct ingress_slot {
+    union {
+        struct ingress_meta meta;
+        struct ingress_rule rule;
+    };
+};
+
+/* Suppresses duplicate events from SYN retransmissions: one connection attempt
+ * re-enters this hook every time the client retries, so a single blocked
+ * connect() was measured emitting two records and a port scan would emit
+ * thousands. Keyed on the connection's four-tuple minus the parts that do not
+ * vary across a retransmit. */
+struct ingress_seen_key {
+    __u8 src[16];
+    __u16 sport;
+    __u16 lport;
+};
+
 struct net_path_scratch {
     char path[PATH_LEN];
 };
@@ -216,6 +273,8 @@ struct net_cgroup_scratch {
 _Static_assert(sizeof(struct net_rule) == 608, "struct net_rule must stay 608 bytes");
 _Static_assert(sizeof(struct net_event) == 1472, "struct net_event must stay 1472 bytes");
 _Static_assert(sizeof(struct net_event) % 8 == 0, "zero_net_event needs a multiple of 8");
+_Static_assert(sizeof(struct ingress_rule) == 44, "struct ingress_rule must stay 44 bytes");
+_Static_assert(sizeof(struct ingress_slot) == 44, "struct ingress_slot must stay 44 bytes");
 
 /* Every inner policy map has this fixed layout: meta then the ordered rules. */
 struct {
@@ -250,6 +309,24 @@ struct {
     __type(key, struct net_cache_key);
     __type(value, struct net_cache_val);
 } net_verdict_cache SEC(".maps");
+
+/* The ingress policy: one global array, not keyed by anything. Slot 0 is the
+ * metadata, slots 1..rule_count the ordered rules — the same shape as an inner
+ * policy map, minus the uid dimension it has no use for. Mode and generation
+ * come from net_runtime_config_map, shared with the egress rules. */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1 + MAX_RULES);
+    __type(key, __u32);
+    __type(value, struct ingress_slot);
+} ingress_policy SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 8192);
+    __type(key, struct ingress_seen_key);
+    __type(value, __u32); /* the generation the record was emitted under */
+} ingress_seen SEC(".maps");
 
 /* bpf_d_path output is kept off the BPF stack; the hooks call policy callbacks
  * and matchers, so a 256-byte local would blow the 512-byte combined limit. */
@@ -941,9 +1018,158 @@ static __always_inline long lsm_ret(long r)
 
 /*
  * ===========================================================================
+ * Ingress evaluation
+ * ===========================================================================
+ */
+struct ingress_ctx {
+    __u8 src[16];
+    __u8 local[16];
+    __u32 count;
+    __u16 sport;
+    __u16 lport;
+    __u8 family;
+    __u8 matched;
+    __u8 status;
+    __u8 emit;
+    int result;
+};
+
+/* Same cheapest-first ordering and first-match-wins semantics as the egress
+ * rules, over a much smaller rule: no patterns to scan, so the whole callback
+ * is a handful of compares plus at most two prefix matches. */
+static long check_ingress_rule_cb(__u32 i, void *data)
+{
+    struct ingress_ctx *ctx = data;
+    __u32 zero = 0, index;
+    struct ingress_slot *slot;
+    struct ingress_rule *r;
+    struct net_runtime_config *cfg;
+    __u8 denied;
+
+    if (i >= ctx->count) return 1;
+    index = 1 + i;
+    slot = bpf_map_lookup_elem(&ingress_policy, &index);
+    if (!slot || !slot->rule.enabled) return 0;
+    r = &slot->rule;
+    if (r->family && r->family != ctx->family) return 0;
+    /* Only TCP reaches this hook, so a rule naming another protocol cannot
+     * match; the field exists so UDP support would not change the ABI. */
+    if (r->protocol && r->protocol != IPPROTO_TCP) return 0;
+    if (r->port_min != 0 || r->port_max != 0xffff) {
+        if (ctx->lport < r->port_min || ctx->lport > r->port_max) return 0;
+    }
+    if (!match_addr_prefix(r->src_addr, r->src_prefix_len, ctx->src)) return 0;
+    if (!match_addr_prefix(r->local_addr, r->local_prefix_len, ctx->local)) return 0;
+
+    ctx->matched = 1;
+    cfg = bpf_map_lookup_elem(&net_runtime_config_map, &zero);
+    denied = r->deny && (!cfg || cfg->mode == MODE_ENFORCE);
+    ctx->status = r->deny && cfg && cfg->mode == MODE_WARN ? 'W' : r->deny ? 'F' : 'S';
+    ctx->emit = !r->no_event;
+    /* Any non-zero return makes tcp_conn_request() drop the SYN. The client
+     * sees a timeout rather than a refusal — there is no way to answer from
+     * here, and staying silent is the conventional behaviour for a filtered
+     * port anyway. */
+    ctx->result = denied ? -13 /* EACCES */ : 0;
+    return 1;   /* FIRST MATCH WINS */
+}
+
+/* Emit an ingress record. Deliberately not emit_net_event(): that one reads
+ * current's cgroup, tty and argv, none of which mean anything in softirq. */
+static __always_inline void emit_ingress_event(const struct ingress_ctx *ctx, __u8 status,
+                                               const char *policy_id)
+{
+    struct net_event *e = bpf_ringbuf_reserve(&net_events, sizeof(*e), 0);
+
+    if (!e) return;
+    zero_net_event(e);
+    e->operation = OP_NET_INGRESS;
+    e->status = status;
+    e->create_timestamp_ns = bpf_ktime_get_ns();
+    e->family = ctx->family;
+    e->protocol = IPPROTO_TCP;
+    e->sock_type = SOCK_STREAM;
+    e->addr_valid = 1;
+    e->no_task = 1;
+    e->remote_port = ctx->sport;
+    e->local_port = ctx->lport;
+    __builtin_memcpy(e->remote_addr, ctx->src, 16);
+    __builtin_memcpy(e->local_addr, ctx->local, 16);
+    if (policy_id)
+        bpf_probe_read_kernel_str(e->policy_id, sizeof(e->policy_id), policy_id);
+    bpf_ringbuf_submit(e, 0);
+}
+
+static __always_inline int check_ingress(struct ingress_ctx *ctx)
+{
+    __u32 zero = 0, gen = 0;
+    struct ingress_slot *meta;
+    struct net_runtime_config *cfg;
+    struct ingress_seen_key seen = {};
+    __u32 *prev;
+
+    meta = bpf_map_lookup_elem(&ingress_policy, &zero);
+    if (!meta) return 0;
+    ctx->count = meta->meta.rule_count;
+    if (ctx->count > MAX_RULES) ctx->count = MAX_RULES;
+    if (ctx->count == 0) return 0;
+
+    bpf_loop(MAX_RULES, check_ingress_rule_cb, ctx, 0);
+    if (!ctx->matched || !ctx->emit) return ctx->result;
+
+    cfg = bpf_map_lookup_elem(&net_runtime_config_map, &zero);
+    gen = cfg ? cfg->generation : 0;
+    __builtin_memcpy(seen.src, ctx->src, 16);
+    seen.sport = ctx->sport;
+    seen.lport = ctx->lport;
+    prev = bpf_map_lookup_elem(&ingress_seen, &seen);
+    if (prev && *prev == gen) return ctx->result;  /* a SYN retransmit */
+    bpf_map_update_elem(&ingress_seen, &seen, &gen, BPF_ANY);
+    emit_ingress_event(ctx, ctx->status, meta->meta.id);
+    return ctx->result;
+}
+
+/*
+ * ===========================================================================
  * Hooks
  * ===========================================================================
  */
+
+/* Inbound TCP, judged at the SYN before any connection state is committed.
+ *
+ * Runs in softirq: there is no current task, so nothing here may call
+ * bpf_get_current_*. Everything needed is already on the request_sock, which
+ * tcp_conn_request() fills in via af_ops->init_req() immediately before calling
+ * this hook — no sk_buff parsing required. sk is the listening socket.
+ *
+ * task_is_exempt() is deliberately absent. Ingress is a host-wide policy with
+ * no user behind it, so there is no session to exempt. */
+SEC("lsm/inet_conn_request")
+long BPF_PROG(check_net_ingress, struct sock *sk, struct sk_buff *skb,
+              struct request_sock *req, int ret)
+{
+    /* Not named ctx: BPF_PROG's expansion already binds that identifier. */
+    struct ingress_ctx ic = {};
+    __u16 family;
+
+    if (ret) return lsm_ret(ret);
+    family = BPF_CORE_READ(req, __req_common.skc_family);
+    if (family == AF_INET) {
+        /* On a request_sock, skc_daddr is ir_rmt_addr (the client) and
+         * skc_rcv_saddr is ir_loc_addr (the address it reached us on). */
+        set_v4_mapped(ic.src, BPF_CORE_READ(req, __req_common.skc_daddr));
+        set_v4_mapped(ic.local, BPF_CORE_READ(req, __req_common.skc_rcv_saddr));
+    } else if (family == AF_INET6) {
+        BPF_CORE_READ_INTO(&ic.src, req, __req_common.skc_v6_daddr);
+        BPF_CORE_READ_INTO(&ic.local, req, __req_common.skc_v6_rcv_saddr);
+    } else {
+        return 0;
+    }
+    ic.family = (__u8)family;
+    ic.lport = BPF_CORE_READ(req, __req_common.skc_num);              /* host order */
+    ic.sport = bpf_ntohs(BPF_CORE_READ(req, __req_common.skc_dport)); /* big endian */
+    return lsm_ret(check_ingress(&ic));
+}
 
 /* socket() and socketpair(). The only hook that sees raw/ICMP sockets before
  * they can do anything, which makes it the practical lever for those: a raw
