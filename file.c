@@ -100,6 +100,15 @@ struct event {
     char cmdline[CMDLINE_LEN];
 };
 
+struct pending_exec_event {
+    __u32 uid;
+    __u8 status;
+    __u8 _pad[3];
+    char file[PATH_LEN];
+    char executable_path[PATH_LEN];
+    char policy_id[POLICY_ID_LEN];
+};
+
 struct executable_path_scratch {
     char path[PATH_LEN];
 };
@@ -146,6 +155,20 @@ struct {
 } events SEC(".maps");
 
 struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u32);
+    __type(value, struct pending_exec_event);
+} pending_execs SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct pending_exec_event);
+} pending_exec_scratch SEC(".maps");
+
+struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
@@ -168,14 +191,6 @@ struct {
     __type(key, __u32);
     __type(value, struct dentry_walk_scratch);
 } dentry_walk_scratch_map SEC(".maps");
-
-/* The execute controls live in exec.c, which is included at the end of this
- * file — by then emit_event(), check() and lsm_ret(), which it builds on, are
- * all in scope. These are the two entry points the policy engine below calls
- * into it, declared here so the dependency between the files runs one way. */
-static __always_inline void queue_exec_event(__u32 uid, __u8 status, const char *path,
-                                             const char *policy_id);
-static __always_inline void clear_pending_exec(void);
 
 /*
  * Verifier-friendly glob matcher. Pattern bytes are stored unescaped; the wild
@@ -458,6 +473,49 @@ static __always_inline void emit_event(__u32 uid, __u8 op, __u8 status,
     bpf_ringbuf_submit(e, 0);
 }
 
+static __always_inline void queue_exec_event(__u32 uid, __u8 status, const char *path,
+                                             const char *policy_id)
+{
+    __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+    __u32 zero = 0;
+    struct pending_exec_event *pending;
+    struct executable_path_scratch *scratch;
+    struct task_struct *task;
+    struct task_struct *parent;
+    struct mm_struct *parent_mm;
+    struct file *exe_file;
+
+    pending = bpf_map_lookup_elem(&pending_exec_scratch, &zero);
+    if (!pending) return;
+    pending->uid = uid;
+    pending->status = status;
+    bpf_probe_read_kernel_str(pending->file, sizeof(pending->file), path);
+    pending->executable_path[0] = '\0';
+    pending->policy_id[0] = '\0';
+    if (policy_id)
+        bpf_probe_read_kernel_str(pending->policy_id, sizeof(pending->policy_id),
+                                  policy_id);
+    scratch = bpf_map_lookup_elem(&executable_path_scratch, &zero);
+    if (scratch) {
+        scratch->path[0] = '\0';
+        task = (struct task_struct *)bpf_get_current_task_btf();
+        /* Keep these as typed pointer dereferences so exe_file stays a trusted
+         * PTR_TO_BTF_ID for bpf_d_path; BPF_CORE_READ would downgrade it to a
+         * scalar and the call would be rejected. Matches check_policy(). */
+        parent = task->real_parent;
+        if (parent) {
+            parent_mm = parent->mm;
+            exe_file = parent_mm ? parent_mm->exe_file : 0;
+            if (exe_file)
+                bpf_d_path(&exe_file->f_path, scratch->path,
+                           sizeof(scratch->path));
+        }
+        bpf_probe_read_kernel_str(pending->executable_path,
+                                  sizeof(pending->executable_path), scratch->path);
+    }
+    bpf_map_update_elem(&pending_execs, &pid, pending, BPF_ANY);
+}
+
 struct policy_check_ctx {
     void *inner;
     const char *path;
@@ -631,7 +689,10 @@ static __always_inline int check(struct file *file, __u8 op)
 
     if (task_is_exempt()) {
         /* Do not retain an older pending exec event for an exempt task. */
-        if (op == OP_EXEC) clear_pending_exec();
+        if (op == OP_EXEC) {
+            __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+            bpf_map_delete_elem(&pending_execs, &pid);
+        }
         return 0;
     }
     path_scratch = bpf_map_lookup_elem(&file_path_scratch, &zero);
@@ -639,7 +700,10 @@ static __always_inline int check(struct file *file, __u8 op)
     path_scratch->path[0] = '\0';
     len = bpf_d_path(&file->f_path, path_scratch->path, PATH_LEN);
     if (len <= 0) return 0;
-    if (op == OP_EXEC) clear_pending_exec();
+    if (op == OP_EXEC) {
+        __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+        bpf_map_delete_elem(&pending_execs, &pid);
+    }
     return check_policy(path_scratch->path, (__u32)len - 1, op);
 }
 
@@ -814,6 +878,13 @@ static __always_inline long lsm_ret(long r)
     return r;
 }
 
+SEC("lsm/bprm_check_security")
+long BPF_PROG(check_exec, struct linux_binprm *bprm, int ret)
+{
+    if (ret) return lsm_ret(ret);
+    return lsm_ret(bprm->file ? check(bprm->file, OP_EXEC) : 0);
+}
+
 SEC("lsm/file_open")
 long BPF_PROG(check_file_open, struct file *file, int ret)
 {
@@ -929,9 +1000,18 @@ long BPF_PROG(check_inode_setattr, struct dentry *dentry, struct iattr *attr)
     return lsm_ret(check_dentry_op(dentry, OP_SETTIME));
 }
 
-/* The execute controls. Included last: everything it builds on — emit_event(),
- * check() and lsm_ret() — is defined above, and it in turn supplies the
- * queue_exec_event()/clear_pending_exec() declared near the top of this file. */
-#include "exec.c"
+SEC("tracepoint/sched/sched_process_exec")
+int emit_committed_exec(void *ctx)
+{
+    __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+    struct pending_exec_event *pending;
+
+    pending = bpf_map_lookup_elem(&pending_execs, &pid);
+    if (!pending) return 0;
+    emit_event(pending->uid, OP_EXEC, pending->status, pending->file,
+               pending->executable_path, pending->policy_id, 1);
+    bpf_map_delete_elem(&pending_execs, &pid);
+    return 0;
+}
 
 char LICENSE[] SEC("license") = "Dual MIT/GPL";
