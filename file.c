@@ -17,6 +17,12 @@
  * is unknown. The two meeting is what makes an unidentified session match only
  * the rules that name nobody. */
 #define EMPLOYEE_ID_ANY 0
+/* Converts start_boottime to the units /proc/<pid>/stat reports. USER_HZ is 100
+ * in the kernel's /proc ABI regardless of CONFIG_HZ, and fs/proc/array.c derives
+ * starttime from the same start_boottime, so dividing here reproduces that field
+ * exactly rather than approximately — which is what lets wdog prime pid_image
+ * from /proc and have the entries pass their own staleness check. */
+#define NSEC_PER_CLOCK 10000000ULL
 /* Policy IDs are typically 32-character strings; 39 bytes + NUL also covers
  * dashed UUIDs, and 40 keeps the fields after it naturally aligned. */
 #define POLICY_ID_LEN 40
@@ -35,6 +41,28 @@
 #define OP_LINK    11
 #define OP_MKNOD   12
 #define OP_TRUNCATE 13
+/* Operations on another process. Governed by proc_rule rather than rule: what
+ * they act on is a task, not a path, so they need their own set of constraints.
+ * The two share one rule array; a rule says which of them it covers in
+ * proc_rule::op_mask. */
+#define OP_KILL    14
+#define OP_PTRACE  15
+
+/* proc_rule::op_mask bits. Separate from the OP_ codes above because those name
+ * the one operation being judged, while a rule carries a set: writing the
+ * target axis once and having it cover both signals and debugging is the usual
+ * case, since a debugger that can attach to a process can drive it wherever it
+ * likes — strictly more than killing it. */
+#define PROC_OP_KILL_BIT   0x01
+#define PROC_OP_PTRACE_BIT 0x02
+
+/* ptrace access modes, from include/linux/ptrace.h. The mode argument also
+ * carries FSCREDS/REALCREDS/NOAUDIT flags, so it is masked down to these two
+ * before matching. ATTACH is debugging proper; READ additionally covers
+ * /proc/<pid>/mem and environ, process_vm_readv() and kcmp(). */
+#define PTRACE_MODE_READ_BIT   0x01
+#define PTRACE_MODE_ATTACH_BIT 0x02
+#define PTRACE_MODE_MASK       0x03
 #define FMODE_READ  0x00000001
 #define FMODE_WRITE 0x00000002
 /* include/linux/fs.h iattr ia_valid flags */
@@ -95,9 +123,68 @@ struct rule {
  * to the wrong fields rather than fail to build. */
 _Static_assert(sizeof(struct rule) == 588, "struct rule must stay 588 bytes");
 
+/* A signal rule. Deliberately not struct rule: the thing being acted on is
+ * another process, so the constraints describe a task rather than a path.
+ *
+ * exec_path is the SENDER's image and target_path the TARGET's, both matched
+ * with the same glob syntax and matcher the file rules use. Neither can come
+ * from bpf_d_path here — the helper is rejected at this attach point on RHEL 9
+ * (measured: "helper call is not allowed") — so both are read out of pid_image,
+ * which the exec hook fills while d_path is still available. That indirection
+ * is the whole reason pid_image exists.
+ *
+ * signals is a bitmask of 1 << signo; 0 means the rule does not constrain the
+ * signal. Signal 0 is the existence-check idiom (kill(pid, 0)) and is included
+ * in "any", so a catch-all deny stops `kill -0` too — the loader warns about
+ * that rather than silently carving it out. */
+struct proc_rule {
+    char exec_path[PATH_LEN];       /*   0 — sender's image */
+    char target_path[PATH_LEN];     /* 256 — target's image */
+    __u8 exec_wild[PATH_LEN / 8];   /* 512 */
+    __u8 target_wild[PATH_LEN / 8]; /* 544 */
+    __u64 signals;                  /* 576 — OP_KILL only */
+    __u32 employee_id;              /* 584 — sender */
+    __u32 target_employee_id;       /* 588 */
+    __u32 target_uid;               /* 592 — target's real uid */
+    __u8 has_target_uid;            /* 596 — target_uid is meaningful */
+    __u8 enabled;                   /* 597 */
+    __u8 deny;                      /* 598 */
+    __u8 no_event;                  /* 599 */
+    __u8 exec_suffix_len;           /* 600 */
+    __u8 target_suffix_len;         /* 601 */
+    __u8 op_mask;                   /* 602 — PROC_OP_*_BIT; which ops this covers */
+    __u8 ptrace_mode;               /* 603 — OP_PTRACE only; 0 = any mode */
+    __u8 _pad[4];                   /* 604 */
+};                                  /* 608 */
+
+/* The two bytes came out of the tail padding, so the process controls did not
+ * move a single field of the file rule they were modelled on. */
+_Static_assert(sizeof(struct proc_rule) == 608, "struct proc_rule must stay 608 bytes");
+
 struct policy_meta {
     __u32 rule_count;
     char id[POLICY_ID_LEN]; /* NUL-terminated policy id */
+};
+
+struct proc_policy_slot {
+    union {
+        struct policy_meta meta;
+        struct proc_rule rule;
+    };
+};
+
+/* A process's executable image, recorded while it can still be resolved.
+ *
+ * start_clock is start_boottime converted to the 1/100s units /proc/<pid>/stat
+ * reports, so wdog can prime this map for processes that were already running
+ * when it started and the two sides compare exactly. It guards against a stale
+ * entry being read for a reused pid — the same job login_uid does in
+ * session_identity. */
+struct pid_image {
+    char exe_path[PATH_LEN];
+    __u64 start_clock;
+    __u32 path_len;     /* strlen, for suffix matching */
+    __u32 _pad;
 };
 
 /* What PAM recorded for one audit session. pam_wdoor.so fills this at
@@ -142,7 +229,11 @@ struct event {
     __u32 audit_session_id;
     __u8 status;
     __u8 operation;
-    __u16 _pad;
+    /* Carved out of what was two bytes of padding, so the record stays exactly
+     * 1428 bytes and file_test.go's pinned layout does not move. Only OP_KILL
+     * sets it. */
+    __u8 signal;
+    __u8 _pad;
     char path[PATH_LEN];
     char executable_path[PATH_LEN];
     char cgroup[PATH_LEN]; /* cgroup v2 path, best-effort */
@@ -195,6 +286,63 @@ struct {
     __type(key, __u32);
     __array(values, typeof(policy_template));
 } active_policy_by_uid SEC(".maps");
+
+/* Signal rules get their own array and their own map-in-map rather than
+ * sharing the file rules': the slot layouts differ, and keeping the two apart
+ * means neither loop walks past rules it can never match. */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1 + MAX_RULES);
+    __type(key, __u32);
+    __type(value, struct proc_policy_slot);
+} proc_policy_template SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
+    __uint(max_entries, 4096);
+    __type(key, __u32);
+    __array(values, typeof(proc_policy_template));
+} active_proc_policy_by_uid SEC(".maps");
+
+/* tgid -> the image that process is running.
+ *
+ * Written on exec (where bpf_d_path works), inherited on fork (a process that
+ * forks without exec keeps its parent's image), and dropped on exit. wdog
+ * primes it from /proc at startup, which is what covers the daemons that were
+ * already running — and those are precisely the processes a kill rule is
+ * usually written to protect.
+ *
+ * LRU rather than a plain hash: unlike session_identity there is no external
+ * writer to report an overflow, and losing an entry degrades to "image
+ * unknown" rather than to a wrong answer. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u32); /* tgid */
+    __type(value, struct pid_image);
+} pid_image SEC(".maps");
+
+/* Staging for pid_image, exactly mirroring pending_execs' reason for existing:
+ * bprm_check_security runs BEFORE the exec is committed, and the exec can still
+ * fail afterwards. Recording the image straight from there would let a process
+ * claim an image it never actually ran. The sched_process_exec tracepoint
+ * promotes the entry once the new image is live. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u32);
+    __type(value, struct pid_image);
+} pending_image SEC(".maps");
+
+/* struct pid_image is 272 bytes — more than half the verifier's 512-byte call
+ * stack, and the exec hook that fills one also calls check(). Assembled here
+ * instead, like every other oversized record in this file. */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct pid_image);
+} pending_image_scratch SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -433,6 +581,15 @@ static __always_inline __u32 current_employee_id(struct task_struct *task,
     return *id;
 }
 
+/* The same resolution for a task that is not the current one — the target of a
+ * signal. Kept separate rather than parameterising current_employee_id because
+ * the login uid has to come from the task itself here, not from the policy
+ * lookup that already resolved it for the caller. */
+static __always_inline __u32 target_employee_id(struct task_struct *task)
+{
+    return current_employee_id(task, BPF_CORE_READ(task, loginuid.val));
+}
+
 /* Rebuild the cgroup v2 path right-to-left over the kernfs parent chain,
  * mirroring the dentry walk below. Reuses dentry_walk_scratch: by the time an
  * event is emitted every hook has already copied its walked path into
@@ -551,7 +708,8 @@ static __always_inline void zero_event(struct event *e)
 
 static __always_inline void emit_event(__u32 uid, __u8 op, __u8 status,
                                        const char *path, const char *executable_path,
-                                       const char *policy_id, __u8 capture_cmdline)
+                                       const char *policy_id, __u8 capture_cmdline,
+                                       __u8 signal)
 {
     struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     struct task_struct *task;
@@ -568,6 +726,7 @@ static __always_inline void emit_event(__u32 uid, __u8 op, __u8 status,
     e->real_uid = (__u32)bpf_get_current_uid_gid();
     e->operation = op;
     e->status = status;
+    e->signal = signal;
     e->create_timestamp_ns = bpf_ktime_get_ns();
     e->pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
     task = (struct task_struct *)bpf_get_current_task_btf();
@@ -718,7 +877,7 @@ static long check_rule_cb(__u32 i, void *data)
             queue_exec_event(ctx->uid, status, ctx->path, ctx->policy_id);
         else
             emit_event(ctx->uid, ctx->op, status, ctx->path, ctx->executable_path,
-                       ctx->policy_id, ctx->op != OP_EXEC);
+                       ctx->policy_id, ctx->op != OP_EXEC, 0);
     }
     ctx->result = denied ? -13 /* EACCES */ : 0;
     return 1;
@@ -1022,11 +1181,244 @@ static __always_inline long lsm_ret(long r)
     return r;
 }
 
+/* ---------------------------------------------------------------------------
+ * Signal control.
+ *
+ * The sender is judged the same way every other operation is — the login uid
+ * picks the policy, the employee narrows the rules. What is new is the TARGET
+ * axis: another task, described by its image, its employee and its uid.
+ *
+ * Neither image can be resolved here. bpf_d_path is rejected at this attach
+ * point on RHEL 9, so both come out of pid_image, filled on exec where the
+ * helper is allowed. An image that is not in the map reads as unknown, and a
+ * rule that constrains that side cannot match — the same fail-to-not-match rule
+ * the employee axis uses, and for the same reason: a process wdog never saw
+ * exec is an ordinary state, not an attack.
+ * ------------------------------------------------------------------------- */
+
+/* The image of a process, or NULL when it is not known. start_clock rejects an
+ * entry left behind by a process whose pid has since been reused. */
+static __always_inline struct pid_image *task_image(struct task_struct *task)
+{
+    __u32 tgid = BPF_CORE_READ(task, tgid);
+    struct pid_image *img = bpf_map_lookup_elem(&pid_image, &tgid);
+
+    if (!img) return 0;
+    if (img->start_clock != BPF_CORE_READ(task, start_boottime) / NSEC_PER_CLOCK)
+        return 0;
+    return img;
+}
+
+struct proc_check_ctx {
+    void *inner;
+    const char *policy_id;
+    const char *exec_path;      /* sender's image, or NULL */
+    const char *target_path;    /* target's image, or NULL */
+    __u32 exec_path_len;
+    __u32 target_path_len;
+    __u32 uid;
+    __u32 employee_id;
+    __u32 target_employee_id;
+    __u32 target_uid;
+    __u32 count;
+    __u32 sig;                  /* OP_KILL: the signal number */
+    __u8 op;                    /* OP_KILL or OP_PTRACE; what the event reports */
+    __u8 op_bit;                /* the same, as the PROC_OP_*_BIT a rule matches on */
+    __u8 ptrace_mode;           /* OP_PTRACE: masked to PTRACE_MODE_MASK */
+    __u8 matched;
+    int result;
+};
+
+static long check_proc_rule_cb(__u32 i, void *data)
+{
+    struct proc_check_ctx *ctx = data;
+    __u32 zero = 0, index;
+    struct proc_policy_slot *slot;
+    struct proc_rule *r;
+    struct runtime_config *cfg;
+    __u8 denied, status;
+
+    if (i >= ctx->count) return 1;
+    index = 1 + i;
+    slot = bpf_map_lookup_elem(ctx->inner, &index);
+    if (!slot || !slot->rule.enabled) return 0;
+    r = &slot->rule;
+
+    /* One array holds the rules for both operations, so the first thing to do
+     * is skip the ones that do not cover this one. A rule may cover both, and
+     * then it is read by both hooks at its one position in the list — which is
+     * what lets a single rule protect a target from signals and debugging
+     * alike, and what keeps first-match-wins meaningful for each operation
+     * independently. */
+    if (!(r->op_mask & ctx->op_bit)) return 0;
+
+    /* Cheapest first, exactly as the network rules order theirs: scalars
+     * before the two pattern scans. */
+    /* sig > 63 cannot be represented in the mask — Linux's SIGRTMAX is 64 and
+     * bit 0 is already signal 0. Masking it down would alias SIGRTMAX onto the
+     * kill(pid, 0) bit, so a rule that names any signal simply does not match
+     * it; the loader rejects 64 in a rule for the same reason. */
+    if (ctx->op == OP_KILL) {
+        if (r->signals && (ctx->sig > 63 || !(r->signals & (1ULL << ctx->sig))))
+            return 0;
+    } else if (r->ptrace_mode && !(r->ptrace_mode & ctx->ptrace_mode)) {
+        return 0;
+    }
+    if (r->employee_id != EMPLOYEE_ID_ANY && r->employee_id != ctx->employee_id)
+        return 0;
+    if (r->target_employee_id != EMPLOYEE_ID_ANY &&
+        r->target_employee_id != ctx->target_employee_id)
+        return 0;
+    if (r->has_target_uid && r->target_uid != ctx->target_uid) return 0;
+
+    if (!pattern_is_empty(r->exec_path, r->exec_wild)) {
+        if (!ctx->exec_path) return 0;
+        if (!match_path_pattern(r->exec_path, r->exec_wild, r->exec_suffix_len,
+                                ctx->exec_path, ctx->exec_path_len))
+            return 0;
+    }
+    if (!pattern_is_empty(r->target_path, r->target_wild)) {
+        if (!ctx->target_path) return 0;
+        if (!match_path_pattern(r->target_path, r->target_wild,
+                                r->target_suffix_len, ctx->target_path,
+                                ctx->target_path_len))
+            return 0;
+    }
+
+    ctx->matched = 1;
+    cfg = bpf_map_lookup_elem(&runtime_config_map, &zero);
+    denied = r->deny && (!cfg || cfg->mode == MODE_ENFORCE);
+    status = r->deny && cfg && cfg->mode == MODE_WARN ? 'W' : r->deny ? 'F' : 'S';
+    if (!r->no_event)
+        emit_event(ctx->uid, ctx->op, status, ctx->target_path ? ctx->target_path : "",
+                   ctx->exec_path, ctx->policy_id, 1,
+                   ctx->op == OP_KILL ? (__u8)ctx->sig : ctx->ptrace_mode);
+    ctx->result = denied ? -13 /* EACCES */ : 0;
+    return 1;   /* FIRST MATCH WINS */
+}
+
+/* Split out of the SEC() program because BPF_PROG names its own parameter
+ * `ctx`, which would shadow the check context — the same reason every other
+ * hook in this file is a thin wrapper over a check_* helper. */
+static __always_inline int check_proc_policy(struct task_struct *p, __u8 op,
+                                             __u8 op_bit, __u32 sig,
+                                             __u8 ptrace_mode)
+{
+    __u32 uid, zero = 0, count;
+    struct task_struct *task;
+    struct proc_policy_slot *meta;
+    struct proc_check_ctx ctx;
+    struct pid_image *self_img, *target_img;
+    void *inner;
+
+    if (task_is_exempt()) return 0;
+    task = (struct task_struct *)bpf_get_current_task_btf();
+    uid = BPF_CORE_READ(task, loginuid.val);
+    inner = bpf_map_lookup_elem(&active_proc_policy_by_uid, &uid);
+    if (!inner) return 0;
+    meta = bpf_map_lookup_elem(inner, &zero);
+    if (!meta) return 0;
+    count = meta->meta.rule_count;
+    if (count > MAX_RULES) count = MAX_RULES;
+    if (count == 0) return 0;
+
+    self_img = task_image(task);
+    target_img = task_image(p);
+    ctx = (struct proc_check_ctx){
+        .inner = inner,
+        .policy_id = meta->meta.id,
+        .exec_path = self_img ? self_img->exe_path : 0,
+        .target_path = target_img ? target_img->exe_path : 0,
+        .exec_path_len = self_img ? self_img->path_len : 0,
+        .target_path_len = target_img ? target_img->path_len : 0,
+        .uid = uid,
+        .employee_id = current_employee_id(task, uid),
+        .target_employee_id = target_employee_id(p),
+        .target_uid = BPF_CORE_READ(p, cred, uid.val),
+        .count = count,
+        .sig = sig,
+        .op = op,
+        .op_bit = op_bit,
+        .ptrace_mode = ptrace_mode,
+    };
+    bpf_loop(MAX_RULES, check_proc_rule_cb, &ctx, 0);
+    return ctx.result;
+}
+
+SEC("lsm/task_kill")
+long BPF_PROG(check_task_kill, struct task_struct *p, struct kernel_siginfo *info,
+             int sig, const struct cred *cred)
+{
+    return lsm_ret(check_proc_policy(p, OP_KILL, PROC_OP_KILL_BIT, (__u32)sig, 0));
+}
+
+/*
+ * Debugging access. Worth controlling alongside signals rather than instead of
+ * them: stopping someone from killing a process while leaving them able to
+ * attach to it protects very little, since a debugger can read its memory and
+ * drive it wherever it likes.
+ *
+ * This hook is not only ptrace(2). The kernel routes every "may I inspect that
+ * task" question through it, so a READ-mode rule also governs /proc/<pid>/mem
+ * and /proc/<pid>/environ, process_vm_readv() and kcmp(). That reach is the
+ * point — reading another process's environ is how credentials leak — but it
+ * does mean a broad deny here stops more than a debugger.
+ *
+ * Access to one's own thread group returns before the hook is reached, so
+ * nothing here can stop a process from inspecting itself.
+ *
+ * PTRACE_TRACEME has its own hook and is deliberately not covered: it is a
+ * process asking its OWN parent to trace it, so it cannot be turned into a way
+ * to reach a task these rules protect.
+ */
+SEC("lsm/ptrace_access_check")
+long BPF_PROG(check_ptrace_access, struct task_struct *child, unsigned int mode)
+{
+    /* mode also carries FSCREDS/REALCREDS/NOAUDIT; only the two access bits
+     * are matched, and a mode outside them matches only unconstrained rules. */
+    return lsm_ret(check_proc_policy(child, OP_PTRACE, PROC_OP_PTRACE_BIT, 0,
+                                     (__u8)(mode & PTRACE_MODE_MASK)));
+}
+
+/* Resolve the image about to be executed and stage it for pid_image.
+ *
+ * Called for EVERY exec, before task_is_exempt() has a say. That is deliberate
+ * and is the whole point: tasks with no audit session are the systemd-started
+ * daemons — sshd, wdog, the database — and they are exactly what a kill rule
+ * is written to protect. Recording only the tasks the file policy judges would
+ * leave the protected set empty. */
+static __always_inline void stage_exec_image(struct file *file)
+{
+    __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32), zero = 0;
+    struct file_path_scratch *ps;
+    struct pid_image *img;
+    long len;
+
+    ps = bpf_map_lookup_elem(&file_path_scratch, &zero);
+    if (!ps) return;
+    ps->path[0] = '\0';
+    /* A second bpf_d_path on the exec path, since check() below resolves its
+     * own and returns early for exempt tasks before it gets there. exec is
+     * rare enough next to open() that unifying the two is not worth the
+     * contortion it would take. */
+    len = bpf_d_path(&file->f_path, ps->path, PATH_LEN);
+    if (len <= 0) return;
+    img = bpf_map_lookup_elem(&pending_image_scratch, &zero);
+    if (!img) return;
+    img->start_clock = 0;   /* filled at the tracepoint, once the exec is real */
+    img->path_len = (__u32)len - 1;
+    img->_pad = 0;
+    bpf_probe_read_kernel_str(img->exe_path, sizeof(img->exe_path), ps->path);
+    bpf_map_update_elem(&pending_image, &pid, img, BPF_ANY);
+}
+
 SEC("lsm/bprm_check_security")
 long BPF_PROG(check_exec, struct linux_binprm *bprm, int ret)
 {
     if (ret) return lsm_ret(ret);
-    return lsm_ret(bprm->file ? check(bprm->file, OP_EXEC) : 0);
+    if (!bprm->file) return 0;
+    stage_exec_image(bprm->file);
+    return lsm_ret(check(bprm->file, OP_EXEC));
 }
 
 SEC("lsm/file_open")
@@ -1149,12 +1541,66 @@ int emit_committed_exec(void *ctx)
 {
     __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
     struct pending_exec_event *pending;
+    struct pid_image *staged;
+
+    /* The exec is now real, so the image staged in bprm_check becomes this
+     * process's current one. Done before the event below because it must
+     * happen for every exec, and the event only fires for some. */
+    staged = bpf_map_lookup_elem(&pending_image, &pid);
+    if (staged) {
+        struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+        staged->start_clock = BPF_CORE_READ(task, start_boottime) / NSEC_PER_CLOCK;
+        bpf_map_update_elem(&pid_image, &pid, staged, BPF_ANY);
+        bpf_map_delete_elem(&pending_image, &pid);
+    }
 
     pending = bpf_map_lookup_elem(&pending_execs, &pid);
     if (!pending) return 0;
     emit_event(pending->uid, OP_EXEC, pending->status, pending->file,
-               pending->executable_path, pending->policy_id, 1);
+               pending->executable_path, pending->policy_id, 1, 0);
     bpf_map_delete_elem(&pending_execs, &pid);
+    return 0;
+}
+
+/* A process that forks without ever calling exec keeps running its parent's
+ * image — a subshell of /bin/bash is still /bin/bash. Without this the child
+ * would have no entry at all and would match no target_path rule, which for a
+ * deny rule means the protection silently does not apply to it. */
+SEC("tp_btf/sched_process_fork")
+int BPF_PROG(track_fork, struct task_struct *parent, struct task_struct *child)
+{
+    __u32 ppid = BPF_CORE_READ(parent, tgid), cpid = BPF_CORE_READ(child, tgid);
+    __u32 zero = 0;
+    struct pid_image *pimg, *copy;
+
+    if (ppid == cpid) return 0;         /* a new thread, not a new process */
+    pimg = bpf_map_lookup_elem(&pid_image, &ppid);
+    if (!pimg) return 0;
+    /* Copied through scratch rather than edited in place: pimg points into the
+     * parent's map value, and stamping the child's start time onto it would
+     * corrupt the parent's entry and make it fail its own staleness check. */
+    copy = bpf_map_lookup_elem(&pending_image_scratch, &zero);
+    if (!copy) return 0;
+    __builtin_memcpy(copy, pimg, sizeof(*copy));
+    /* The child gets its own start time: the entry must stay verifiable
+     * against the task it now describes, not the one it was copied from. */
+    copy->start_clock = BPF_CORE_READ(child, start_boottime) / NSEC_PER_CLOCK;
+    bpf_map_update_elem(&pid_image, &cpid, copy, BPF_ANY);
+    return 0;
+}
+
+/* Drop the entry when the process is gone. The LRU would eventually reclaim it
+ * and start_clock would catch a reused pid regardless, but neither is a reason
+ * to leave the table full of the dead. */
+SEC("tp_btf/sched_process_exit")
+int BPF_PROG(track_exit, struct task_struct *task)
+{
+    __u32 pid = BPF_CORE_READ(task, pid), tgid = BPF_CORE_READ(task, tgid);
+
+    if (pid != tgid) return 0;          /* a thread exiting, not the process */
+    bpf_map_delete_elem(&pid_image, &tgid);
+    bpf_map_delete_elem(&pending_image, &tgid);
     return 0;
 }
 
