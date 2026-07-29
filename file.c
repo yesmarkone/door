@@ -9,6 +9,14 @@
 #define PATH_LEN 256
 #define TTY_LEN  64
 #define CMDLINE_LEN 512
+/* Employee names are short human identifiers, not paths; 64 bytes leaves room
+ * for a 63-character name plus its NUL. Rules do not store the name — see
+ * struct rule::employee_id — but the session record and the intern table do. */
+#define EMPLOYEE_NAME_LEN 64
+/* A rule that constrains no employee, and the id of a session whose employee
+ * is unknown. The two meeting is what makes an unidentified session match only
+ * the rules that name nobody. */
+#define EMPLOYEE_ID_ANY 0
 /* Policy IDs are typically 32-character strings; 39 bytes + NUL also covers
  * dashed UUIDs, and 40 keeps the fields after it naturally aligned. */
 #define POLICY_ID_LEN 40
@@ -51,12 +59,28 @@
  * A pattern whose first byte is a wildcard '*' is a suffix match. The loader
  * fills the matching *_suffix_len with the number of pattern bytes after that
  * '*', which is what lets the matcher jump straight to the path's tail instead
- * of backtracking. It is 0 for prefix and empty patterns. */
+ * of backtracking. It is 0 for prefix and empty patterns.
+ *
+ * employee_id is the second user axis, alongside the login uid that selected
+ * the policy: it scopes the rule to one person, so one policy on a shared
+ * account can be split per employee. EMPLOYEE_ID_ANY means the rule constrains
+ * no employee, which is what a rule that names none encodes to.
+ *
+ * It is an id rather than the name itself, and that is not an optimization —
+ * it is what makes the rule loop verifiable. Comparing a name here means
+ * branching on a pointer whose null-ness the verifier cannot know, and that
+ * fork doubles the exploration of both glob matchers below it; measured on
+ * RHEL 9 (5.14), it put check_net_sendmsg in net.c past the one-million
+ * instruction ceiling and the object stopped loading. A scalar compare costs
+ * nothing. The loader interns each distinct name to an id and publishes the
+ * mapping in employee_ids, which check_policy consults once per check —
+ * outside the loop, where one pointer branch is affordable. */
 struct rule {
     char exec_path[PATH_LEN];
     char path[PATH_LEN];
     __u8 exec_wild[PATH_LEN / 8];
     __u8 path_wild[PATH_LEN / 8];
+    __u32 employee_id;
     __u8 enabled;
     __u8 permission;
     __u8 deny;
@@ -66,9 +90,39 @@ struct rule {
     __u8 _pad[2];
 };
 
+/* The userspace loader writes this by byte offset (cmd/wdog/file.go) and
+ * file_test.go pins the size, so a silent layout change here would apply policy
+ * to the wrong fields rather than fail to build. */
+_Static_assert(sizeof(struct rule) == 588, "struct rule must stay 588 bytes");
+
 struct policy_meta {
     __u32 rule_count;
     char id[POLICY_ID_LEN]; /* NUL-terminated policy id */
+};
+
+/* What PAM recorded for one audit session. pam_wdoor.so fills this at
+ * open_session and removes it at close_session; wdog reaps records whose
+ * session no longer has a live process.
+ *
+ * login_uid is not a matching criterion — it exists so a record left behind by
+ * a session whose id has since been reused cannot lend its name to a different
+ * user.
+ *
+ * INVARIANT: employee_name must be zero-padded to its full width, not merely
+ * NUL-terminated. It is used as a hash-map key below, and a key is compared as
+ * a fixed-size block of bytes — junk after the terminator would look up nothing
+ * at all. pam_wdoor.c memsets the value before filling it for this reason. */
+struct session_identity {
+    char employee_name[EMPLOYEE_NAME_LEN];
+    __u32 login_uid;
+    __u32 _pad;
+};
+
+/* Key of the intern table: a name, padded to a fixed width so it can be hashed.
+ * Deliberately the same layout as session_identity's leading field, so a
+ * session record's name is looked up in place with no copy. */
+struct employee_name_key {
+    char name[EMPLOYEE_NAME_LEN];
 };
 
 struct policy_slot {
@@ -148,6 +202,44 @@ struct {
     __type(key, __u32);
     __type(value, struct runtime_config);
 } runtime_config_map SEC(".maps");
+
+/* Audit session id -> the employee PAM logged in on it. Written from userspace
+ * only (pam_wdoor.so on login/logout, wdog's reaper for sessions that died
+ * without a close_session), read here on every check.
+ *
+ * Pinned, and declared identically in net.c, because the two BPF objects cannot
+ * share a map any other way: LIBBPF_PIN_BY_NAME makes whichever object loads
+ * second attach to the map the first one created. The pin also outlives wdog,
+ * so a restart does not lose the identities of sessions already logged in.
+ *
+ * A plain hash rather than an LRU on purpose: evicting a live session's record
+ * would silently stop its name-scoped deny rules from matching. Overflow is
+ * reported by PAM instead, and the reaper keeps the table from filling with
+ * sessions that are already gone. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u32); /* audit session id */
+    __type(value, struct session_identity);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+} session_identity SEC(".maps");
+
+/* Employee name -> the id rules carry, interned by the loader. Written only by
+ * wdog, and only while installing policies; read here once per check.
+ *
+ * Ids are assigned in order of first appearance and never reused for as long as
+ * wdog runs, so a policy replacement cannot silently repoint an id that rules
+ * from the previous generation still reference.
+ *
+ * Pinned and shared exactly like session_identity, and for the same reason: the
+ * file and network objects have to agree on the id space. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, struct employee_name_key);
+    __type(value, __u32);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+} employee_ids SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -302,6 +394,43 @@ static __always_inline int match_path_pattern(const char *pattern, const __u8 *w
     }
     bpf_loop(PATH_LEN, match_path_cb, &ctx, 0);
     return ctx.matched;
+}
+
+/* Resolve this task's audit session to the employee id its rules are written
+ * against: session -> name (what PAM recorded) -> id (what the loader interned).
+ *
+ * EMPLOYEE_ID_ANY comes back whenever that chain breaks, and every break is an
+ * ordinary state rather than a failure: no PAM module installed, no name
+ * configured for the login, or a name no rule mentions. Since a rule scoped to
+ * an employee carries a non-zero id, such a session matches only the rules that
+ * name nobody — deny rules included. Failing closed instead would deny every
+ * unidentified session everything any name-scoped deny rule mentions, which is
+ * most of the machine. "Deny whoever is not identified" is written as a
+ * trailing catch-all deny rule naming no employee, which first-match-wins
+ * reaches once the per-person rules above it have missed.
+ *
+ * Called once per check, before the rule loop. That placement is deliberate:
+ * everything here branches on pointers, and doing any of it per rule is what
+ * exhausts the verifier — see struct rule::employee_id. */
+static __always_inline __u32 current_employee_id(struct task_struct *task,
+                                                 __u32 login_uid)
+{
+    __u32 sid = BPF_CORE_READ(task, sessionid);
+    struct session_identity *si;
+    __u32 *id;
+
+    if (sid == (__u32)-1) return EMPLOYEE_ID_ANY;
+    si = bpf_map_lookup_elem(&session_identity, &sid);
+    if (!si) return EMPLOYEE_ID_ANY;
+    /* Audit session ids are reused after a reboot, and a session killed hard
+     * never runs close_session. A record whose login uid no longer matches is
+     * one of those leftovers and must not lend its name to this task. */
+    if (si->login_uid != login_uid) return EMPLOYEE_ID_ANY;
+    /* The name is looked up in place: employee_name_key is exactly the leading
+     * field of the record, so no copy to a key buffer is needed. */
+    id = bpf_map_lookup_elem(&employee_ids, si->employee_name);
+    if (!id) return EMPLOYEE_ID_ANY;
+    return *id;
 }
 
 /* Rebuild the cgroup v2 path right-to-left over the kernfs parent chain,
@@ -521,6 +650,9 @@ struct policy_check_ctx {
     const char *path;
     const char *executable_path;
     const char *policy_id;
+    /* The caller's interned employee id, EMPLOYEE_ID_ANY when unknown.
+     * Resolved once per check rather than per rule; see current_employee_id. */
+    __u32 employee_id;
     __u32 uid;
     __u32 count;
     /* strlen of the two paths, for suffix matching. A value >= PATH_LEN means
@@ -554,6 +686,10 @@ static long check_rule_cb(__u32 i, void *data)
     if (!slot || !slot->rule.enabled) return 0;
     r = &slot->rule;
     if (!(r->permission & ctx->perm_bit)) return 0;
+    /* Scalars only, on purpose: see struct rule::employee_id. An unidentified
+     * caller has EMPLOYEE_ID_ANY, so a rule scoped to anyone cannot match it. */
+    if (r->employee_id != EMPLOYEE_ID_ANY && r->employee_id != ctx->employee_id)
+        return 0;
     if (ctx->executable_path) {
         if (ctx->exec_resolved) {
             if (!match_path_pattern(r->exec_path, r->exec_wild,
@@ -602,8 +738,12 @@ static __always_inline int task_is_exempt(void)
  * permission bit rules must carry: exec(1), read(2), or write(4) for every
  * write-class operation (write, truncate, unlink, rename, chmod, chown,
  * settime, mkdir, symlink, link, mknod). The first rule whose permission bit,
- * exec_path pattern (current process image) and path pattern all match
- * decides the outcome. */
+ * employee_id, exec_path pattern (current process image) and path pattern all
+ * match decides the outcome.
+ *
+ * The employee is the second user axis: the login uid picks the policy, the
+ * employee picks which of its rules apply. That is what makes a shared account —
+ * one uid, many people — controllable per person. */
 static __always_inline int check_policy(const char *path, __u32 path_len, __u8 op)
 {
     __u32 uid, zero = 0, count, exec_path_len = 0;
@@ -663,6 +803,10 @@ static __always_inline int check_policy(const char *path, __u32 path_len, __u8 o
         .path = path,
         .executable_path = executable_path,
         .policy_id = meta->meta.id,
+        /* Two hash lookups per check, next to the bpf_d_path above that costs
+         * considerably more. Policies with no name-scoped rules still pay them,
+         * but never consult the result. */
+        .employee_id = current_employee_id(task, uid),
         .uid = uid,
         .count = count,
         .path_len = path_len,

@@ -18,6 +18,9 @@
 //   lsm_ret()                                       door.c:863-879
 //   path_match_ctx, match_path_cb, match_suffix_cb  door.c:204-263
 //   pattern_is_empty/_is_suffix/match_path_pattern  door.c:269-305
+//   struct session_identity, struct employee_name_key, current_employee_id()
+//   the session_identity and employee_ids maps (SHARED via their pins, not
+//   merely duplicated — the declarations must stay byte-identical)
 //   task_is_exempt()                                door.c:591-596
 //   kernfs_node_parent(), cgroup_walk_cb()          door.c:319-381
 //   fill_cgroup()   (retargeted at struct net_event)
@@ -35,6 +38,8 @@
 #define TTY_LEN  64
 #define CMDLINE_LEN 512
 #define POLICY_ID_LEN 40
+#define EMPLOYEE_NAME_LEN 64
+#define EMPLOYEE_ID_ANY 0
 #define MAX_RULES 512
 #define MAX_CGROUP_DEPTH 32
 #define MODE_ENFORCE 0
@@ -100,6 +105,11 @@ struct net_rule {
     char path[PATH_LEN];
     __u8 exec_wild[PATH_LEN / 8];
     __u8 path_wild[PATH_LEN / 8];
+    /* The second user axis, alongside the login uid that selected the policy.
+     * An interned id rather than the name itself — see struct rule in door.c,
+     * where check_net_sendmsg below is the program that made that necessary.
+     * EMPLOYEE_ID_ANY constrains nobody. */
+    __u32 employee_id;
     __u8 addr[16];
     __u8 enabled;
     __u8 permission;    /* NPERM_* bitmask */
@@ -119,6 +129,19 @@ struct net_rule {
 struct net_policy_meta {
     __u32 rule_count;
     char id[POLICY_ID_LEN]; /* NUL-terminated policy id */
+};
+
+/* Copied from door.c — the two objects must agree on these layouts byte for
+ * byte, because they share the pinned maps holding them. See door.c for the
+ * rationale on login_uid and on the zero-padding invariant. */
+struct session_identity {
+    char employee_name[EMPLOYEE_NAME_LEN];
+    __u32 login_uid;
+    __u32 _pad;
+};
+
+struct employee_name_key {
+    char name[EMPLOYEE_NAME_LEN];
 };
 
 struct net_policy_slot {
@@ -188,6 +211,10 @@ struct net_event {
  * matched too, which covers a socket handed to another process over
  * SCM_RIGHTS.
  *
+ * The audit session id is matched alongside the uid, and has to be: on a shared
+ * account two people log in under the SAME uid but different employee names, so
+ * a uid check alone would let one person's verdict decide the other's send.
+ *
  * Only IP sockets are cached: an AF_UNIX destination is a path that does not
  * fit here, and hashing one risks a collision deciding an access. */
 struct net_cache_key {
@@ -196,8 +223,9 @@ struct net_cache_key {
 
 struct net_cache_val {
     __u32 generation;
-    __u32 uid;    /* login uid the verdict was decided for */
-    __u8 addr[16];/* destination it applies to */
+    __u32 uid;        /* login uid the verdict was decided for */
+    __u32 session_id; /* audit session, so two people on one account differ */
+    __u8 addr[16];    /* destination it applies to */
     __u16 port;
     __u8 verdict; /* 1 = denied */
     __u8 emitted; /* the event for this (socket, destination) already went out */
@@ -270,7 +298,7 @@ struct net_cgroup_scratch {
 /* The userspace loader writes these two by byte offset (cmd/wdog/net.go) and
  * pins the sizes in net_test.go, so a silent layout change here would corrupt
  * policy and events rather than fail to build. */
-_Static_assert(sizeof(struct net_rule) == 608, "struct net_rule must stay 608 bytes");
+_Static_assert(sizeof(struct net_rule) == 612, "struct net_rule must stay 612 bytes");
 _Static_assert(sizeof(struct net_event) == 1472, "struct net_event must stay 1472 bytes");
 _Static_assert(sizeof(struct net_event) % 8 == 0, "zero_net_event needs a multiple of 8");
 _Static_assert(sizeof(struct ingress_rule) == 44, "struct ingress_rule must stay 44 bytes");
@@ -297,6 +325,30 @@ struct {
     __type(key, __u32);
     __type(value, struct net_runtime_config);
 } net_runtime_config_map SEC(".maps");
+
+/* Audit session id -> the employee PAM logged in on it. THE SAME MAP door.c
+ * declares, not a copy: LIBBPF_PIN_BY_NAME means whichever object loads second
+ * attaches to the one the first created, which is the only way these two
+ * objects can share state. Every attribute below must therefore stay identical
+ * to door.c's declaration, or the second load fails on a layout mismatch. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u32); /* audit session id */
+    __type(value, struct session_identity);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+} session_identity SEC(".maps");
+
+/* Employee name -> the id rules carry. THE SAME MAP door.c declares, shared
+ * through its pin; both objects must resolve a name to the same id. Every
+ * attribute must stay identical to door.c's declaration. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, struct employee_name_key);
+    __type(value, __u32);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+} employee_ids SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -480,6 +532,25 @@ static __always_inline int match_addr_prefix(const __u8 *rule, __u8 prefix_len,
     return 1;
 }
 
+/* Copied from door.c: session -> name -> interned id, resolved once per check.
+ * See there for why every break in that chain yields EMPLOYEE_ID_ANY rather
+ * than failing closed, and why none of this may happen per rule. */
+static __always_inline __u32 current_employee_id(struct task_struct *task,
+                                                 __u32 login_uid)
+{
+    __u32 sid = BPF_CORE_READ(task, sessionid);
+    struct session_identity *si;
+    __u32 *id;
+
+    if (sid == (__u32)-1) return EMPLOYEE_ID_ANY;
+    si = bpf_map_lookup_elem(&session_identity, &sid);
+    if (!si) return EMPLOYEE_ID_ANY;
+    if (si->login_uid != login_uid) return EMPLOYEE_ID_ANY;
+    id = bpf_map_lookup_elem(&employee_ids, si->employee_name);
+    if (!id) return EMPLOYEE_ID_ANY;
+    return *id;
+}
+
 /* Everything one hook learned about the socket it is deciding on. */
 struct net_target {
     __u8 addr[16];      /* normalized peer (connect/sendmsg) or local address */
@@ -493,13 +564,6 @@ struct net_target {
     __u8 has_addr;      /* an IP address/port was resolved */
     __u8 is_remote;     /* address describes the peer, not the local end */
 };
-
-static __always_inline __u32 current_loginuid(void)
-{
-    struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
-
-    return BPF_CORE_READ(task, loginuid.val);
-}
 
 static __always_inline int addrs_equal(const __u8 *a, const __u8 *b)
 {
@@ -840,6 +904,9 @@ struct net_check_ctx {
     const struct net_target *t;
     const char *executable_path;
     const char *policy_id;
+    /* The caller's interned employee id, EMPLOYEE_ID_ANY when unknown.
+     * Resolved once per check rather than per rule. */
+    __u32 employee_id;
     __u32 uid;
     __u32 count;
     __u32 exec_path_len;
@@ -877,6 +944,9 @@ static long check_net_rule_cb(__u32 i, void *data)
     if (!slot || !slot->rule.enabled) return 0;
     r = &slot->rule;
     if (!(r->permission & ctx->perm_bit)) return 0;
+    /* Scalars only, on purpose: see struct rule::employee_id in door.c. */
+    if (r->employee_id != EMPLOYEE_ID_ANY && r->employee_id != ctx->employee_id)
+        return 0;
     if (r->family && r->family != t->family) return 0;
     if (r->sock_type && r->sock_type != t->sock_type) return 0;
     if (r->protocol && r->protocol != t->protocol) return 0;
@@ -934,7 +1004,9 @@ static __always_inline int task_is_exempt(void)
 /* Evaluate a resolved socket target against the caller's policy. Policies are
  * selected — and events attributed — by the audit login uid, which pam_loginuid
  * assigns at login and which survives su/sudo, so a user stays under their own
- * policy after switching to root. The first rule whose permission bit and every
+ * policy after switching to root. A rule's employee_name narrows it further to
+ * one person on that account — the login uid picks the policy, the name picks
+ * which of its rules apply. The first rule whose permission bit and every
  * constraint match decides the outcome. Unlike door.c there is no audit event
  * for the no-rule-matched case; only a matching rule emits. */
 static __always_inline int check_net_policy(const struct net_target *t, __u8 op,
@@ -986,6 +1058,10 @@ static __always_inline int check_net_policy(const struct net_target *t, __u8 op,
         .t = t,
         .executable_path = executable_path,
         .policy_id = meta->meta.id,
+        /* Two hash lookups per check, next to the bpf_d_path above that costs
+         * considerably more. Policies with no name-scoped rules still pay them,
+         * but never consult the result. */
+        .employee_id = current_employee_id(task, uid),
         .uid = uid,
         .count = count,
         .exec_path_len = exec_path_len,
@@ -1323,17 +1399,23 @@ long BPF_PROG(check_net_sendmsg, struct socket *sock, struct msghdr *msg,
     gen = cfg ? cfg->generation : 0;
 
     if (t.has_addr && t.sk) {
-        __u32 uid = current_loginuid();
+        struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+        __u32 uid = BPF_CORE_READ(task, loginuid.val);
+        /* Two people on a shared account have the same login uid, so the
+         * session is what tells their verdicts apart. */
+        __u32 sid = BPF_CORE_READ(task, sessionid);
 
         key.sk = t.sk;
         val = bpf_map_lookup_elem(&net_verdict_cache, &key);
         if (val && val->generation == gen && val->uid == uid &&
+            val->session_id == sid &&
             val->port == t.port && addrs_equal(val->addr, t.addr))
             return lsm_ret(val->verdict ? -13 /* EACCES */ : 0);
 
         r = check_net_policy(&t, OP_NET_SEND, NPERM_CONNECT);
         nv.generation = gen;
         nv.uid = uid;
+        nv.session_id = sid;
         __builtin_memcpy(nv.addr, t.addr, 16);
         nv.port = t.port;
         nv.verdict = r ? 1 : 0;
