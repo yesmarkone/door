@@ -47,6 +47,25 @@
  * proc_rule::op_mask. */
 #define OP_KILL    14
 #define OP_PTRACE  15
+/* A task changing its OWN credentials. Governed by cred_rule: there is no
+ * second process and no path, only the identity being acquired. 16-19 are the
+ * gap between the process controls and the network codes in net.c. */
+#define OP_SETUID  16
+#define OP_SETGID  17
+
+/* cred_rule::op_mask bits, the same kind of set proc_rule carries: one rule
+ * covers the user switch, the group switch, or both. */
+#define CRED_OP_SETUID_BIT 0x01
+#define CRED_OP_SETGID_BIT 0x02
+
+/* include/linux/security.h; the flags argument of task_fix_setuid/setgid says
+ * which syscall family made the change. Reported on the event, never matched —
+ * glibc's seteuid() lowers to setresuid(), so a rule distinguishing them would
+ * not do what its author expected. */
+#define LSM_SETID_ID  1
+#define LSM_SETID_RE  2
+#define LSM_SETID_RES 4
+#define LSM_SETID_FS  8
 
 /* proc_rule::op_mask bits. Separate from the OP_ codes above because those name
  * the one operation being judged, while a rule carries a set: writing the
@@ -161,6 +180,47 @@ struct proc_rule {
  * move a single field of the file rule they were modelled on. */
 _Static_assert(sizeof(struct proc_rule) == 608, "struct proc_rule must stay 608 bytes");
 
+/* A credential-switch rule: the task changing its OWN user or group identity,
+ * which is what su and sudo do once they are running.
+ *
+ * There is deliberately no "from" field. The source identity is the audit login
+ * uid, and that is already the key active_cred_policy_by_uid was looked up by —
+ * a from_uid would either restate it or be dead. Read a rule as "the login uid
+ * this policy belongs to may not acquire to_uid".
+ *
+ * The momentary real uid is not a usable source axis either: sudo runs a
+ * permission state machine, and after its first hop old->uid is 0 for the rest
+ * of the run, so a 1000 -> oracle switch never happens as a single hop. A rule
+ * written against that would be perfectly formed and never match. The old real
+ * id is reported on the event instead, where it says which hop tripped the rule.
+ *
+ * to_uid/to_gid match an id the task is NEWLY ACQUIRING — present in the new
+ * credentials and absent from the old ones, across all four id slots. Matching
+ * the real uid alone would miss a process that retains a saved uid and later
+ * calls seteuid(0); requiring the id to be newly acquired is also what keeps
+ * the no-op calls sudo makes by the dozen from matching anything.
+ *
+ * exec_path cannot come from bpf_d_path — the helper is rejected at the
+ * credential hooks exactly as it is at task_kill — so it is read out of
+ * pid_image, filled on exec where the helper is allowed. */
+struct cred_rule {
+    char exec_path[PATH_LEN];       /*   0 — the switching process's image */
+    __u8 exec_wild[PATH_LEN / 8];   /* 256 */
+    __u32 employee_id;              /* 288 */
+    __u32 to_uid;                   /* 292 — OP_SETUID only */
+    __u32 to_gid;                   /* 296 — OP_SETGID only */
+    __u8 has_to_uid;                /* 300 — to_uid is meaningful */
+    __u8 has_to_gid;                /* 301 — to_gid is meaningful */
+    __u8 op_mask;                   /* 302 — CRED_OP_*_BIT; which ops this covers */
+    __u8 enabled;                   /* 303 */
+    __u8 deny;                      /* 304 */
+    __u8 no_event;                  /* 305 */
+    __u8 exec_suffix_len;           /* 306 */
+    __u8 _pad[1];                   /* 307 */
+};                                  /* 308 */
+
+_Static_assert(sizeof(struct cred_rule) == 308, "struct cred_rule must stay 308 bytes");
+
 struct policy_meta {
     __u32 rule_count;
     char id[POLICY_ID_LEN]; /* NUL-terminated policy id */
@@ -170,6 +230,13 @@ struct proc_policy_slot {
     union {
         struct policy_meta meta;
         struct proc_rule rule;
+    };
+};
+
+struct cred_policy_slot {
+    union {
+        struct policy_meta meta;
+        struct cred_rule rule;
     };
 };
 
@@ -229,11 +296,12 @@ struct event {
     __u32 audit_session_id;
     __u8 status;
     __u8 operation;
-    /* Carved out of what was two bytes of padding, so the record stays exactly
-     * 1428 bytes and file_test.go's pinned layout does not move. Only OP_KILL
-     * sets it. */
+    /* Both carved out of what was two bytes of padding, so neither addition
+     * moved a field that file_test.go's pinned layout already names. signal is
+     * OP_KILL only; setid_flags is OP_SETUID/OP_SETGID only and carries the
+     * LSM_SETID_* family that made the change. */
     __u8 signal;
-    __u8 _pad;
+    __u8 setid_flags;
     char path[PATH_LEN];
     char executable_path[PATH_LEN];
     char cgroup[PATH_LEN]; /* cgroup v2 path, best-effort */
@@ -243,7 +311,22 @@ struct event {
     __u32 ppid;
     __u32 cmdline_len;
     char cmdline[CMDLINE_LEN];
+    /* OP_SETUID/OP_SETGID only. to_id is the identity being acquired — what the
+     * rule matched on. from_id is the old credentials' real id and is
+     * diagnostic: on a multi-step switch such as sudo's it says which hop
+     * tripped the rule. Who the person is, is uid, the login uid above.
+     *
+     * These two went on the end rather than into the tail padding because there
+     * were only four spare bytes there and this needs eight. The record's
+     * declared length goes 1428 -> 1436 and its sizeof 1432 -> 1440. */
+    __u32 from_id;
+    __u32 to_id;
 };
+
+/* zero_event clears the record eight bytes at a time and bpf_ringbuf_reserve is
+ * given sizeof(), so the total must stay a multiple of 8. The Go side reads
+ * only the declared 1436 and file_test.go pins the offsets. */
+_Static_assert(sizeof(struct event) == 1440, "struct event must stay 1440 bytes");
 
 struct pending_exec_event {
     __u32 uid;
@@ -303,6 +386,23 @@ struct {
     __type(key, __u32);
     __array(values, typeof(proc_policy_template));
 } active_proc_policy_by_uid SEC(".maps");
+
+/* Credential rules get a third array for the same reason the signal rules got a
+ * second one: the slot is a different size, and a setuid check has no business
+ * walking rules that can only ever match a signal. */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1 + MAX_RULES);
+    __type(key, __u32);
+    __type(value, struct cred_policy_slot);
+} cred_policy_template SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
+    __uint(max_entries, 4096);
+    __type(key, __u32);
+    __array(values, typeof(cred_policy_template));
+} active_cred_policy_by_uid SEC(".maps");
 
 /* tgid -> the image that process is running.
  *
@@ -706,10 +806,19 @@ static __always_inline void zero_event(struct event *e)
         p[i] = 0;
 }
 
+/* The credential hooks' share of the event, passed by pointer so the other
+ * three emit_event call sites stay as they were. NULL means "not a credential
+ * event" and leaves the three fields zero. */
+struct cred_event_ids {
+    __u32 from_id;
+    __u32 to_id;
+    __u8 flags;
+};
+
 static __always_inline void emit_event(__u32 uid, __u8 op, __u8 status,
                                        const char *path, const char *executable_path,
                                        const char *policy_id, __u8 capture_cmdline,
-                                       __u8 signal)
+                                       __u8 signal, const struct cred_event_ids *ids)
 {
     struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     struct task_struct *task;
@@ -727,6 +836,11 @@ static __always_inline void emit_event(__u32 uid, __u8 op, __u8 status,
     e->operation = op;
     e->status = status;
     e->signal = signal;
+    if (ids) {
+        e->from_id = ids->from_id;
+        e->to_id = ids->to_id;
+        e->setid_flags = ids->flags;
+    }
     e->create_timestamp_ns = bpf_ktime_get_ns();
     e->pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
     task = (struct task_struct *)bpf_get_current_task_btf();
@@ -877,7 +991,7 @@ static long check_rule_cb(__u32 i, void *data)
             queue_exec_event(ctx->uid, status, ctx->path, ctx->policy_id);
         else
             emit_event(ctx->uid, ctx->op, status, ctx->path, ctx->executable_path,
-                       ctx->policy_id, ctx->op != OP_EXEC, 0);
+                       ctx->policy_id, ctx->op != OP_EXEC, 0, 0);
     }
     ctx->result = denied ? -13 /* EACCES */ : 0;
     return 1;
@@ -1292,7 +1406,7 @@ static long check_proc_rule_cb(__u32 i, void *data)
     if (!r->no_event)
         emit_event(ctx->uid, ctx->op, status, ctx->target_path ? ctx->target_path : "",
                    ctx->exec_path, ctx->policy_id, 1,
-                   ctx->op == OP_KILL ? (__u8)ctx->sig : ctx->ptrace_mode);
+                   ctx->op == OP_KILL ? (__u8)ctx->sig : ctx->ptrace_mode, 0);
     ctx->result = denied ? -13 /* EACCES */ : 0;
     return 1;   /* FIRST MATCH WINS */
 }
@@ -1378,6 +1492,244 @@ long BPF_PROG(check_ptrace_access, struct task_struct *child, unsigned int mode)
      * are matched, and a mode outside them matches only unconstrained rules. */
     return lsm_ret(check_proc_policy(child, OP_PTRACE, PROC_OP_PTRACE_BIT, 0,
                                      (__u8)(mode & PTRACE_MODE_MASK)));
+}
+
+/* -------------------------------------------------------------------------
+ * Credential switching — setuid/setgid, and so su and sudo.
+ *
+ * The identity a task is switching TO is the thing an exec rule cannot see:
+ * `sudo -u root` and `sudo -u oracle` are the same execve. That is what these
+ * two hooks add, and the README leads with it.
+ *
+ * The identity it is switching FROM is the audit login uid, which already chose
+ * the policy — see struct cred_rule for why the momentary real uid is not a
+ * usable source axis. As with the process controls, bpf_d_path is rejected here
+ * so the image comes from pid_image.
+ * ------------------------------------------------------------------------- */
+
+/* The four id slots of a credential, in a fixed order shared by the new and old
+ * sides so they can be compared positionally: real, effective, saved, fs. */
+#define CRED_ID_SLOTS 4
+
+/* Which of the new credential's ids the task did not already hold. Positional
+ * rather than compacted — gained[i] qualifies ids[i] — because a variable-index
+ * write into a stack array is exactly the kind of thing the verifier makes
+ * expensive, and matching four slots twice costs less than avoiding it.
+ * Duplicates are harmless: the same id in two slots is simply tested twice. */
+struct acquired_ids {
+    __u32 ids[CRED_ID_SLOTS];
+    __u8 gained[CRED_ID_SLOTS];
+    __u8 any;
+};
+
+static __always_inline void acquired_ids_diff(struct acquired_ids *out,
+                                              const __u32 *new_ids,
+                                              const __u32 *old_ids)
+{
+    out->any = 0;
+#pragma unroll
+    for (int i = 0; i < CRED_ID_SLOTS; i++) {
+        __u8 held = 0;
+
+        out->ids[i] = new_ids[i];
+#pragma unroll
+        for (int j = 0; j < CRED_ID_SLOTS; j++)
+            if (old_ids[j] == new_ids[i]) held = 1;
+        out->gained[i] = !held;
+        if (!held) out->any = 1;
+    }
+}
+
+/* The id to report when a rule that named none matched: the first slot the task
+ * actually gained, in real/effective/saved/fs order. */
+static __always_inline __u32 primary_acquired(const struct acquired_ids *a)
+{
+#pragma unroll
+    for (int i = 0; i < CRED_ID_SLOTS; i++)
+        if (a->gained[i]) return a->ids[i];
+    return a->ids[0];
+}
+
+struct cred_check_ctx {
+    void *inner;
+    const char *policy_id;
+    const char *exec_path;      /* the switching process's image, or NULL */
+    const struct acquired_ids *acquired;
+    __u32 exec_path_len;
+    __u32 uid;                  /* login uid; the policy key and the event's */
+    __u32 employee_id;
+    __u32 from_id;              /* old real uid/gid, for the event only */
+    __u32 count;
+    __u8 op;                    /* OP_SETUID or OP_SETGID */
+    __u8 op_bit;                /* the same, as the CRED_OP_*_BIT a rule matches */
+    __u8 setid_flags;           /* LSM_SETID_*, for the event only */
+    __u8 matched;
+    int result;
+};
+
+static long check_cred_rule_cb(__u32 i, void *data)
+{
+    struct cred_check_ctx *ctx = data;
+    __u32 zero = 0, index, to_id;
+    struct cred_policy_slot *slot;
+    struct cred_rule *r;
+    struct runtime_config *cfg;
+    struct cred_event_ids ids;
+    __u8 denied, status, constrained, want_match = 0;
+
+    if (i >= ctx->count) return 1;
+    index = 1 + i;
+    slot = bpf_map_lookup_elem(ctx->inner, &index);
+    if (!slot || !slot->rule.enabled) return 0;
+    r = &slot->rule;
+
+    /* One array holds the rules for both operations, so skip the ones that do
+     * not cover this one — the same gate proc rules open with, and what keeps
+     * first-match-wins meaningful for each operation independently. */
+    if (!(r->op_mask & ctx->op_bit)) return 0;
+
+    /* Cheapest first: the destination id is four scalar compares, the employee
+     * one more, and only then the single pattern scan. */
+    constrained = ctx->op == OP_SETUID ? r->has_to_uid : r->has_to_gid;
+    if (constrained) {
+        to_id = ctx->op == OP_SETUID ? r->to_uid : r->to_gid;
+#pragma unroll
+        for (int j = 0; j < CRED_ID_SLOTS; j++)
+            if (ctx->acquired->gained[j] && ctx->acquired->ids[j] == to_id)
+                want_match = 1;
+        if (!want_match) return 0;
+    } else {
+        to_id = primary_acquired(ctx->acquired);
+    }
+    if (r->employee_id != EMPLOYEE_ID_ANY && r->employee_id != ctx->employee_id)
+        return 0;
+
+    if (!pattern_is_empty(r->exec_path, r->exec_wild)) {
+        if (!ctx->exec_path) return 0;
+        if (!match_path_pattern(r->exec_path, r->exec_wild, r->exec_suffix_len,
+                                ctx->exec_path, ctx->exec_path_len))
+            return 0;
+    }
+
+    ctx->matched = 1;
+    cfg = bpf_map_lookup_elem(&runtime_config_map, &zero);
+    denied = r->deny && (!cfg || cfg->mode == MODE_ENFORCE);
+    status = r->deny && cfg && cfg->mode == MODE_WARN ? 'W' : r->deny ? 'F' : 'S';
+    if (!r->no_event) {
+        ids.from_id = ctx->from_id;
+        ids.to_id = to_id;
+        ids.flags = ctx->setid_flags;
+        /* No path: nothing is being acted on but the task's own identity. The
+         * image that is doing it goes in executable_path, as everywhere else. */
+        emit_event(ctx->uid, ctx->op, status, "", ctx->exec_path,
+                   ctx->policy_id, 1, 0, &ids);
+    }
+    ctx->result = denied ? -13 /* EACCES */ : 0;
+    return 1;   /* FIRST MATCH WINS */
+}
+
+static __always_inline int check_cred_policy(const struct cred *new_cred,
+                                             const struct cred *old_cred,
+                                             __u8 op, __u8 op_bit, int flags)
+{
+    __u32 uid, zero = 0, count;
+    __u32 new_ids[CRED_ID_SLOTS], old_ids[CRED_ID_SLOTS];
+    struct acquired_ids acquired;
+    struct task_struct *task;
+    struct cred_policy_slot *meta;
+    struct cred_check_ctx ctx;
+    struct pid_image *self_img;
+    void *inner;
+
+    if (task_is_exempt()) return 0;
+
+    /* op is a constant at each call site, so only one of these survives. */
+    if (op == OP_SETUID) {
+        new_ids[0] = BPF_CORE_READ(new_cred, uid.val);
+        new_ids[1] = BPF_CORE_READ(new_cred, euid.val);
+        new_ids[2] = BPF_CORE_READ(new_cred, suid.val);
+        new_ids[3] = BPF_CORE_READ(new_cred, fsuid.val);
+        old_ids[0] = BPF_CORE_READ(old_cred, uid.val);
+        old_ids[1] = BPF_CORE_READ(old_cred, euid.val);
+        old_ids[2] = BPF_CORE_READ(old_cred, suid.val);
+        old_ids[3] = BPF_CORE_READ(old_cred, fsuid.val);
+    } else {
+        new_ids[0] = BPF_CORE_READ(new_cred, gid.val);
+        new_ids[1] = BPF_CORE_READ(new_cred, egid.val);
+        new_ids[2] = BPF_CORE_READ(new_cred, sgid.val);
+        new_ids[3] = BPF_CORE_READ(new_cred, fsgid.val);
+        old_ids[0] = BPF_CORE_READ(old_cred, gid.val);
+        old_ids[1] = BPF_CORE_READ(old_cred, egid.val);
+        old_ids[2] = BPF_CORE_READ(old_cred, sgid.val);
+        old_ids[3] = BPF_CORE_READ(old_cred, fsgid.val);
+    }
+    acquired_ids_diff(&acquired, new_ids, old_ids);
+    /* Before the map lookup on purpose. The kernel calls these hooks on every
+     * setuid-family syscall including the ones that change nothing, and sudo
+     * alone makes a dozen of those per run; a task that gains no identity has
+     * nothing any rule here can be about. */
+    if (!acquired.any) return 0;
+
+    task = (struct task_struct *)bpf_get_current_task_btf();
+    uid = BPF_CORE_READ(task, loginuid.val);
+    inner = bpf_map_lookup_elem(&active_cred_policy_by_uid, &uid);
+    if (!inner) return 0;
+    meta = bpf_map_lookup_elem(inner, &zero);
+    if (!meta) return 0;
+    count = meta->meta.rule_count;
+    if (count > MAX_RULES) count = MAX_RULES;
+    if (count == 0) return 0;
+
+    self_img = task_image(task);
+    ctx = (struct cred_check_ctx){
+        .inner = inner,
+        .policy_id = meta->meta.id,
+        .exec_path = self_img ? self_img->exe_path : 0,
+        .acquired = &acquired,
+        .exec_path_len = self_img ? self_img->path_len : 0,
+        .uid = uid,
+        .employee_id = current_employee_id(task, uid),
+        .from_id = old_ids[0],
+        .count = count,
+        .op = op,
+        .op_bit = op_bit,
+        .setid_flags = (__u8)flags,
+    };
+    bpf_loop(MAX_RULES, check_cred_rule_cb, &ctx, 0);
+    return ctx.result;
+}
+
+/*
+ * setuid(2) and its relatives — setreuid, setresuid, setfsuid. This is the hook
+ * su and sudo trip when they switch user, and denying it makes them fail with
+ * "cannot set user id" rather than silently proceed.
+ *
+ * Called before the new credentials are committed, so bpf_get_current_uid_gid()
+ * inside emit_event still reports the old real uid.
+ *
+ * One caveat worth knowing: __sys_setfsuid discards the LSM error and returns
+ * the old fsuid with no errno at all. A deny on an LSM_SETID_FS change is
+ * therefore audited but not felt by the caller.
+ */
+SEC("lsm/task_fix_setuid")
+long BPF_PROG(check_task_fix_setuid, struct cred *new, const struct cred *old, int flags)
+{
+    return lsm_ret(check_cred_policy(new, old, OP_SETUID, CRED_OP_SETUID_BIT, flags));
+}
+
+/*
+ * setgid(2) and its relatives. Its own hook and its own selector because a
+ * kernel that predates 5.13 has no task_fix_setgid to attach to.
+ *
+ * This covers the PRIMARY group only. security_task_fix_setgroups, which would
+ * cover the supplementary list that initgroups() sets, does not exist on the
+ * RHEL 9 kernels this runs on, so joining a privileged group that way is not
+ * visible here. The README says so plainly.
+ */
+SEC("lsm/task_fix_setgid")
+long BPF_PROG(check_task_fix_setgid, struct cred *new, const struct cred *old, int flags)
+{
+    return lsm_ret(check_cred_policy(new, old, OP_SETGID, CRED_OP_SETGID_BIT, flags));
 }
 
 /* Resolve the image about to be executed and stage it for pid_image.
@@ -1558,7 +1910,7 @@ int emit_committed_exec(void *ctx)
     pending = bpf_map_lookup_elem(&pending_execs, &pid);
     if (!pending) return 0;
     emit_event(pending->uid, OP_EXEC, pending->status, pending->file,
-               pending->executable_path, pending->policy_id, 1, 0);
+               pending->executable_path, pending->policy_id, 1, 0, 0);
     bpf_map_delete_elem(&pending_execs, &pid);
     return 0;
 }
