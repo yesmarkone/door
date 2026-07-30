@@ -27,6 +27,12 @@
  * dashed UUIDs, and 40 keeps the fields after it naturally aligned. */
 #define POLICY_ID_LEN 40
 #define MAX_RULES 512
+/* Slot 0 of an inner policy map holds the metadata, so a rule always sits at
+ * 1 + its position in the config array and slot 0 can never name one. That is
+ * what makes it usable as the event's "no rule matched" value — and it is also
+ * what a record produced by an older object, whose bytes there are zero, reports.
+ * The alternative, an all-ones sentinel, would make such a record claim rule 0. */
+#define RULE_SLOT_NONE 0u
 #define OP_EXEC    1
 #define OP_READ    2
 #define OP_WRITE   3
@@ -399,12 +405,29 @@ struct event {
      * declared length goes 1428 -> 1436 and its sizeof 1432 -> 1440. */
     __u32 from_id;
     __u32 to_id;
+    /* Which rule of policy_id above decided this: the inner-map slot it
+     * occupied, i.e. 1 + its position in the policy's rule array, or
+     * RULE_SLOT_NONE. Userspace subtracts the one; see cmd/wdog/file.go's
+     * ruleIndex. Which array it indexes follows from operation — file, proc and
+     * cred rules are three separate lists.
+     *
+     * This is the four bytes of tail padding the note above says were too few
+     * for from_id/to_id. Spending them costs nothing: sizeof was already 1440,
+     * so the record does not grow, and the declared length now equals it. */
+    __u32 rule_slot;
 };
 
 /* zero_event clears the record eight bytes at a time and bpf_ringbuf_reserve is
- * given sizeof(), so the total must stay a multiple of 8. The Go side reads
- * only the declared 1436 and file_test.go pins the offsets. */
+ * given sizeof(), so the total must stay a multiple of 8. The declared length
+ * is now the whole 1440 — there is no tail padding left — and file_test.go pins
+ * the offsets. */
 _Static_assert(sizeof(struct event) == 1440, "struct event must stay 1440 bytes");
+/* rule_slot went into padding that already existed, which is the whole reason
+ * the assert above did not have to move. Pin that: a field inserted ahead of it
+ * would keep sizeof at 1440 by eating the padding elsewhere and silently shift
+ * every offset cmd/wdog/file_test.go hard-codes. */
+_Static_assert(__builtin_offsetof(struct event, rule_slot) == 1436,
+               "event.rule_slot must stay at offset 1436 (cmd/wdog/file_test.go)");
 
 struct pending_exec_event {
     __u32 uid;
@@ -413,6 +436,12 @@ struct pending_exec_event {
     char file[PATH_LEN];
     char executable_path[PATH_LEN];
     char policy_id[POLICY_ID_LEN];
+    /* Carried to emit_committed_exec so a staged exec reports the same rule an
+     * inline decision would. queue_exec_event takes it as a required argument
+     * rather than defaulting it, because the percpu scratch this is staged
+     * through is not cleared between execs — an unset field would report the
+     * previous exec's rule on that CPU rather than none. */
+    __u32 rule_slot;
 };
 
 struct executable_path_scratch {
@@ -896,7 +925,8 @@ struct cred_event_ids {
 static __always_inline void emit_event(__u32 uid, __u8 op, __u8 status,
                                        const char *path, const char *executable_path,
                                        const char *policy_id, __u8 capture_cmdline,
-                                       __u8 signal, const struct cred_event_ids *ids)
+                                       __u8 signal, const struct cred_event_ids *ids,
+                                       __u32 rule_slot)
 {
     struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     struct task_struct *task;
@@ -914,6 +944,7 @@ static __always_inline void emit_event(__u32 uid, __u8 op, __u8 status,
     e->operation = op;
     e->status = status;
     e->signal = signal;
+    e->rule_slot = rule_slot;
     if (ids) {
         e->from_id = ids->from_id;
         e->to_id = ids->to_id;
@@ -954,7 +985,7 @@ static __always_inline void emit_event(__u32 uid, __u8 op, __u8 status,
 }
 
 static __always_inline void queue_exec_event(__u32 uid, __u8 status, const char *path,
-                                             const char *policy_id)
+                                             const char *policy_id, __u32 rule_slot)
 {
     __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
     __u32 zero = 0;
@@ -969,6 +1000,7 @@ static __always_inline void queue_exec_event(__u32 uid, __u8 status, const char 
     if (!pending) return;
     pending->uid = uid;
     pending->status = status;
+    pending->rule_slot = rule_slot;
     bpf_probe_read_kernel_str(pending->file, sizeof(pending->file), path);
     pending->executable_path[0] = '\0';
     pending->policy_id[0] = '\0';
@@ -1081,10 +1113,10 @@ static long check_rule_cb(__u32 i, void *data)
     status = r->deny ? (warn ? 'W' : 'F') : 'S';
     if (!r->no_event) {
         if (ctx->op == OP_EXEC && !denied)
-            queue_exec_event(ctx->uid, status, ctx->path, ctx->policy_id);
+            queue_exec_event(ctx->uid, status, ctx->path, ctx->policy_id, index);
         else
             emit_event(ctx->uid, ctx->op, status, ctx->path, ctx->executable_path,
-                       ctx->policy_id, ctx->op != OP_EXEC, 0, 0);
+                       ctx->policy_id, ctx->op != OP_EXEC, 0, 0, index);
     }
     ctx->result = denied ? -13 /* EACCES */ : 0;
     return 1;
@@ -1129,18 +1161,19 @@ static __always_inline int check_policy(const char *path, __u32 path_len, __u8 o
     uid = BPF_CORE_READ(task, loginuid.val);
     inner = bpf_map_lookup_elem(&active_policy_by_uid, &uid);
     if (!inner) {
-        if (op == OP_EXEC) queue_exec_event(uid, 'S', path, 0);
+        if (op == OP_EXEC) queue_exec_event(uid, 'S', path, 0, RULE_SLOT_NONE);
         return 0;
     }
     meta = bpf_map_lookup_elem(inner, &zero);
     if (!meta) {
-        if (op == OP_EXEC) queue_exec_event(uid, 'S', path, 0);
+        if (op == OP_EXEC) queue_exec_event(uid, 'S', path, 0, RULE_SLOT_NONE);
         return 0;
     }
     count = meta->meta.rule_count;
     if (count > MAX_RULES) count = MAX_RULES;
     if (count == 0) {
-        if (op == OP_EXEC) queue_exec_event(uid, 'S', path, meta->meta.id);
+        if (op == OP_EXEC)
+            queue_exec_event(uid, 'S', path, meta->meta.id, RULE_SLOT_NONE);
         return 0;
     }
     /* Resolve the current process image for exec_path matching. For OP_EXEC
@@ -1190,9 +1223,10 @@ static __always_inline int check_policy(const char *path, __u32 path_len, __u8 o
     bpf_loop(MAX_RULES, check_rule_cb, &ctx, 0);
     /* A configured policy still audits allowed executables that did not match
      * any rule.  Allowed matching rules have already queued their own event
-     * in check_rule_cb. */
+     * in check_rule_cb. Nothing decided this one, so it carries no rule slot —
+     * which is how such a record is told apart from an allow a rule granted. */
     if (op == OP_EXEC && !ctx.matched)
-        queue_exec_event(uid, 'S', path, meta->meta.id);
+        queue_exec_event(uid, 'S', path, meta->meta.id, RULE_SLOT_NONE);
     return ctx.result;
 }
 
@@ -1508,7 +1542,7 @@ static long check_proc_rule_cb(__u32 i, void *data)
     if (!r->no_event)
         emit_event(ctx->uid, ctx->op, status, ctx->target_path ? ctx->target_path : "",
                    ctx->exec_path, ctx->policy_id, 1,
-                   ctx->op == OP_KILL ? (__u8)ctx->sig : ctx->ptrace_mode, 0);
+                   ctx->op == OP_KILL ? (__u8)ctx->sig : ctx->ptrace_mode, 0, index);
     ctx->result = denied ? -13 /* EACCES */ : 0;
     return 1;   /* FIRST MATCH WINS */
 }
@@ -1748,7 +1782,7 @@ static long check_cred_rule_cb(__u32 i, void *data)
         /* No path: nothing is being acted on but the task's own identity. The
          * image that is doing it goes in executable_path, as everywhere else. */
         emit_event(ctx->uid, ctx->op, status, "", ctx->exec_path,
-                   ctx->policy_id, 1, 0, &ids);
+                   ctx->policy_id, 1, 0, &ids, index);
     }
     ctx->result = denied ? -13 /* EACCES */ : 0;
     return 1;   /* FIRST MATCH WINS */
@@ -2047,7 +2081,8 @@ int emit_committed_exec(void *ctx)
     pending = bpf_map_lookup_elem(&pending_execs, &pid);
     if (!pending) return 0;
     emit_event(pending->uid, OP_EXEC, pending->status, pending->file,
-               pending->executable_path, pending->policy_id, 1, 0, 0);
+               pending->executable_path, pending->policy_id, 1, 0, 0,
+               pending->rule_slot);
     bpf_map_delete_elem(&pending_execs, &pid);
     return 0;
 }

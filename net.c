@@ -41,6 +41,12 @@
 #define EMPLOYEE_NAME_LEN 64
 #define EMPLOYEE_ID_ANY 0
 #define MAX_RULES 512
+/* Slot 0 of an inner policy map holds the metadata, so a rule always sits at
+ * 1 + its position in the config array and slot 0 can never name one — which is
+ * what makes it the event's "no rule matched" value. A second copy of door.c's
+ * definition: the two objects share no header, only the layouts they both
+ * describe, the same way struct session_identity is duplicated below. */
+#define RULE_SLOT_NONE 0u
 #define MAX_CGROUP_DEPTH 32
 #define MODE_ENFORCE 0
 #define MODE_WARN    1
@@ -199,7 +205,16 @@ struct net_event {
     __u32 pid;                 /*   72 */
     __u32 ppid;                /*   76 */
     __u32 cmdline_len;         /*   80 */
-    __u32 _pad2;               /*   84 */
+    /* Which rule of policy_id below decided this: the inner-map slot it
+     * occupied, i.e. 1 + its position in the policy's rule array, or
+     * RULE_SLOT_NONE. Userspace subtracts the one; see cmd/wdog/file.go's
+     * ruleIndex. For OP_NET_INGRESS it indexes the host-wide ingress policy's
+     * rules, for every other operation the uid's netRules.
+     *
+     * This is the reserved hole _pad2 held. The record has no tail padding to
+     * grow into — see the 1472 below — so taking the hole is what keeps every
+     * offset after it, and both asserts, exactly where they were. */
+    __u32 rule_slot;           /*   84 */
     char path[PATH_LEN];       /*   88 — AF_UNIX socket path; empty for IP */
     char executable_path[PATH_LEN]; /* 344 */
     char cgroup[PATH_LEN];     /*  600 — cgroup v2 path, best-effort */
@@ -320,6 +335,12 @@ struct net_cgroup_scratch {
 _Static_assert(sizeof(struct net_rule) == 612, "struct net_rule must stay 612 bytes");
 _Static_assert(sizeof(struct net_event) == 1472, "struct net_event must stay 1472 bytes");
 _Static_assert(sizeof(struct net_event) % 8 == 0, "zero_net_event needs a multiple of 8");
+/* rule_slot took over a hole that already existed, which is why the 1472 above
+ * did not have to move. Pin that: a field inserted ahead of it would hold the
+ * size by consuming the hole elsewhere and silently shift every offset
+ * cmd/wdog/net_test.go hard-codes. */
+_Static_assert(__builtin_offsetof(struct net_event, rule_slot) == 84,
+               "net_event.rule_slot must stay at offset 84 (cmd/wdog/net_test.go)");
 _Static_assert(sizeof(struct ingress_rule) == 44, "struct ingress_rule must stay 44 bytes");
 /* 48, not the rule's 44: ingress_meta gained a warning byte at offset 44 and is
  * now the wider member of the union. See struct ingress_slot. */
@@ -851,7 +872,7 @@ static __always_inline void zero_net_event(struct net_event *e)
 static __always_inline void emit_net_event(__u32 uid, __u8 op, __u8 status,
                                            const struct net_target *t,
                                            const char *executable_path,
-                                           const char *policy_id)
+                                           const char *policy_id, __u32 rule_slot)
 {
     struct net_event *e = bpf_ringbuf_reserve(&net_events, sizeof(*e), 0);
     struct task_struct *task;
@@ -868,6 +889,7 @@ static __always_inline void emit_net_event(__u32 uid, __u8 op, __u8 status,
     e->real_uid = (__u32)bpf_get_current_uid_gid();
     e->operation = op;
     e->status = status;
+    e->rule_slot = rule_slot;
     e->create_timestamp_ns = bpf_ktime_get_ns();
     e->pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
     e->family = t->family;
@@ -931,6 +953,11 @@ struct net_check_ctx {
     __u32 uid;
     __u32 count;
     __u32 exec_path_len;
+    /* The matching rule's slot, for the same reason status and emit are here:
+     * the emit happens after bpf_loop, so what the callback decided has to
+     * survive it. door.c's file, proc and cred contexts carry no such field —
+     * they emit from inside the callback and pass the slot as an argument. */
+    __u32 rule_slot;
     __u8 op;
     __u8 perm_bit;
     __u8 matched;
@@ -1017,6 +1044,7 @@ static long check_net_rule_cb(__u32 i, void *data)
     denied = r->deny && !warn;
     ctx->status = r->deny ? (warn ? 'W' : 'F') : 'S';
     ctx->emit = !r->no_event;
+    ctx->rule_slot = index;
     ctx->result = denied ? -13 /* EACCES */ : 0;
     return 1;   /* FIRST MATCH WINS */
 }
@@ -1096,13 +1124,18 @@ static __always_inline int check_net_policy(const struct net_target *t, __u8 op,
         .uid = uid,
         .count = count,
         .exec_path_len = exec_path_len,
+        /* Redundant while the sentinel is zero and the initializer zero-fills
+         * the rest, but it says what an unmatched check reports rather than
+         * leaving it to be inferred. */
+        .rule_slot = RULE_SLOT_NONE,
         .op = op,
         .perm_bit = perm_bit,
         .exec_resolved = exec_resolved,
     };
     bpf_loop(MAX_RULES, check_net_rule_cb, &ctx, 0);
     if (ctx.matched && ctx.emit)
-        emit_net_event(uid, op, ctx.status, t, executable_path, meta->meta.id);
+        emit_net_event(uid, op, ctx.status, t, executable_path, meta->meta.id,
+                       ctx.rule_slot);
     return ctx.result;
 }
 
@@ -1132,6 +1165,10 @@ struct ingress_ctx {
     __u8 src[16];
     __u8 local[16];
     __u32 count;
+    /* The matching rule's slot, carried for the same reason status and emit
+     * are: emit_ingress_event runs after bpf_loop. It reads this off the ctx it
+     * already takes, so nothing about that function's signature changes. */
+    __u32 rule_slot;
     __u16 sport;
     __u16 lport;
     __u8 family;
@@ -1179,6 +1216,7 @@ static long check_ingress_rule_cb(__u32 i, void *data)
     denied = r->deny && !warn;
     ctx->status = r->deny ? (warn ? 'W' : 'F') : 'S';
     ctx->emit = !r->no_event;
+    ctx->rule_slot = index;
     /* Any non-zero return makes tcp_conn_request() drop the SYN. The client
      * sees a timeout rather than a refusal — there is no way to answer from
      * here, and staying silent is the conventional behaviour for a filtered
@@ -1199,6 +1237,7 @@ static __always_inline void emit_ingress_event(const struct ingress_ctx *ctx, __
     zero_net_event(e);
     e->operation = OP_NET_INGRESS;
     e->status = status;
+    e->rule_slot = ctx->rule_slot;
     e->create_timestamp_ns = bpf_ktime_get_ns();
     e->family = ctx->family;
     e->protocol = IPPROTO_TCP;
