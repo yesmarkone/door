@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 OR MIT
 //
-// pam_wdoor.so — records who logged in on each audit session, so the LSM
+// pam_wood.so — records who logged in on each audit session, so the LSM
 // policy can control a shared account per person.
 //
 // The login uid alone cannot tell two people apart on an account like `oracle`
@@ -22,7 +22,7 @@
 // Placement in the stack matters:
 //
 //     session    required   pam_loginuid.so
-//     session    optional   pam_wdoor.so
+//     session    optional   pam_wood.so
 //
 // pam_loginuid.so is what assigns the audit session id, so this module must run
 // after it; before it, /proc/self/sessionid still reads -1 and there is nothing
@@ -178,7 +178,7 @@ int pam_sm_open_session(pam_handle_t *pamh, int flags, int argc, const char **ar
 	sid = current_session_id();
 	if (sid < 0) {
 		pam_syslog(pamh, LOG_WARNING,
-			   "no audit session id; place pam_wdoor.so AFTER pam_loginuid.so in the session stack");
+			   "no audit session id; place pam_wood.so AFTER pam_loginuid.so in the session stack");
 		return PAM_SUCCESS;
 	}
 	uid = current_login_uid();

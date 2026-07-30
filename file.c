@@ -256,7 +256,7 @@ struct pid_image {
     __u32 _pad;
 };
 
-/* What PAM recorded for one audit session. pam_wdoor.so fills this at
+/* What PAM recorded for one audit session. pam_wood.so fills this at
  * open_session and removes it at close_session; wdog reaps records whose
  * session no longer has a live process.
  *
@@ -267,7 +267,7 @@ struct pid_image {
  * INVARIANT: employee_name must be zero-padded to its full width, not merely
  * NUL-terminated. It is used as a hash-map key below, and a key is compared as
  * a fixed-size block of bytes — junk after the terminator would look up nothing
- * at all. pam_wdoor.c memsets the value before filling it for this reason. */
+ * at all. pam_wood.c memsets the value before filling it for this reason. */
 struct session_identity {
     char employee_name[EMPLOYEE_NAME_LEN];
     __u32 login_uid;
@@ -456,7 +456,7 @@ struct {
 } runtime_config_map SEC(".maps");
 
 /* Audit session id -> the employee PAM logged in on it. Written from userspace
- * only (pam_wdoor.so on login/logout, wdog's reaper for sessions that died
+ * only (pam_wood.so on login/logout, wdog's reaper for sessions that died
  * without a close_session), read here on every check.
  *
  * Pinned, and declared identically in net.c, because the two BPF objects cannot
