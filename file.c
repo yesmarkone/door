@@ -274,10 +274,33 @@ struct cred_rule {
 
 _Static_assert(sizeof(struct cred_rule) == 308, "struct cred_rule must stay 308 bytes");
 
+/* Slot 0 of every inner policy map. warning makes the whole policy
+ * observe-only: its deny rules are allowed through and reported 'W' instead of
+ * 'F'. It is the per-policy twin of runtime_config::mode, and the two are OR'd
+ * at each decision site.
+ *
+ * It lives here rather than in each rule because it describes the policy, not
+ * the rule — putting it on struct rule would replicate one bit across up to
+ * MAX_RULES slots, and would have to find spare padding in four differently
+ * shaped rule structs. Here one offset serves all five policy spaces.
+ *
+ * Do not fold it into the last byte of id. POLICY_ID_LEN is 40 while the loader
+ * writes at most 39 characters, so byte 43 looks free, but it is the NUL
+ * terminator of a maximum-length id: a flag there would make
+ * bpf_probe_read_kernel_str() run off the end of id and corrupt the event's
+ * policy_id. */
 struct policy_meta {
     __u32 rule_count;
     char id[POLICY_ID_LEN]; /* NUL-terminated policy id */
+    __u8 warning;           /* 44 — deny rules report 'W' and are not enforced */
 };
+
+/* The loader writes warning by byte offset (cmd/wdog/file.go's putMeta), and
+ * every policy space — file, proc, cred, net, ingress — shares this layout, so
+ * a silent move here would apply the flag to the wrong field in five places at
+ * once rather than fail to build. */
+_Static_assert(__builtin_offsetof(struct policy_meta, warning) == 44,
+               "policy_meta.warning must stay at offset 44 (cmd/wdog/file.go)");
 
 struct proc_policy_slot {
     union {
@@ -994,6 +1017,10 @@ struct policy_check_ctx {
     __u8 perm_mask;
     __u8 matched;
     __u8 exec_resolved; /* current process image was resolved via bpf_d_path */
+    /* The deciding policy's observe-only flag; see struct policy_meta. Read
+     * once from the meta slot the caller already resolved, so unlike the
+     * runtime config it cannot be missing at decision time. */
+    __u8 warning;
     int result;
 };
 
@@ -1009,7 +1036,7 @@ static long check_rule_cb(__u32 i, void *data)
     struct policy_slot *slot;
     struct rule *r;
     struct runtime_config *cfg;
-    __u8 denied, status;
+    __u8 denied, status, warn;
 
     if (i >= ctx->count) return 1;
     index = 1 + i;
@@ -1044,8 +1071,14 @@ static long check_rule_cb(__u32 i, void *data)
 
     ctx->matched = 1;
     cfg = bpf_map_lookup_elem(&runtime_config_map, &zero);
-    denied = r->deny && (!cfg || cfg->mode == MODE_ENFORCE);
-    status = r->deny && cfg && cfg->mode == MODE_WARN ? 'W' : r->deny ? 'F' : 'S';
+    /* Warn either because this policy is observe-only or because the whole host
+     * is. Note what this does NOT change: cfg == NULL still enforces, so a
+     * failed runtime_config lookup remains fail-closed for every policy that
+     * leaves warning clear. The policy flag is safe to trust here because it
+     * came from a meta slot check_policy already read successfully. */
+    warn = ctx->warning || (cfg && cfg->mode == MODE_WARN);
+    denied = r->deny && !warn;
+    status = r->deny ? (warn ? 'W' : 'F') : 'S';
     if (!r->no_event) {
         if (ctx->op == OP_EXEC && !denied)
             queue_exec_event(ctx->uid, status, ctx->path, ctx->policy_id);
@@ -1138,6 +1171,7 @@ static __always_inline int check_policy(const char *path, __u32 path_len, __u8 o
         .path = path,
         .executable_path = executable_path,
         .policy_id = meta->meta.id,
+        .warning = meta->meta.warning,
         /* Two hash lookups per check, next to the bpf_d_path above that costs
          * considerably more. Policies with no name-scoped rules still pay them,
          * but never consult the result. */
@@ -1404,6 +1438,7 @@ struct proc_check_ctx {
     __u8 op_bit;                /* the same, as the PROC_OP_*_BIT a rule matches on */
     __u8 ptrace_mode;           /* OP_PTRACE: masked to PTRACE_MODE_MASK */
     __u8 matched;
+    __u8 warning;               /* see struct policy_check_ctx::warning */
     int result;
 };
 
@@ -1414,7 +1449,7 @@ static long check_proc_rule_cb(__u32 i, void *data)
     struct proc_policy_slot *slot;
     struct proc_rule *r;
     struct runtime_config *cfg;
-    __u8 denied, status;
+    __u8 denied, status, warn;
 
     if (i >= ctx->count) return 1;
     index = 1 + i;
@@ -1465,8 +1500,11 @@ static long check_proc_rule_cb(__u32 i, void *data)
 
     ctx->matched = 1;
     cfg = bpf_map_lookup_elem(&runtime_config_map, &zero);
-    denied = r->deny && (!cfg || cfg->mode == MODE_ENFORCE);
-    status = r->deny && cfg && cfg->mode == MODE_WARN ? 'W' : r->deny ? 'F' : 'S';
+    /* Per-policy or host-wide; see check_rule_cb for why cfg == NULL still
+     * enforces. */
+    warn = ctx->warning || (cfg && cfg->mode == MODE_WARN);
+    denied = r->deny && !warn;
+    status = r->deny ? (warn ? 'W' : 'F') : 'S';
     if (!r->no_event)
         emit_event(ctx->uid, ctx->op, status, ctx->target_path ? ctx->target_path : "",
                    ctx->exec_path, ctx->policy_id, 1,
@@ -1505,6 +1543,7 @@ static __always_inline int check_proc_policy(struct task_struct *p, __u8 op,
     ctx = (struct proc_check_ctx){
         .inner = inner,
         .policy_id = meta->meta.id,
+        .warning = meta->meta.warning,
         .exec_path = self_img ? self_img->exe_path : 0,
         .target_path = target_img ? target_img->exe_path : 0,
         .exec_path_len = self_img ? self_img->path_len : 0,
@@ -1654,6 +1693,7 @@ struct cred_check_ctx {
     __u8 op_bit;                /* the same, as the CRED_OP_*_BIT a rule matches */
     __u8 setid_flags;           /* LSM_SETID_*, for the event only */
     __u8 matched;
+    __u8 warning;               /* see struct policy_check_ctx::warning */
     int result;
 };
 
@@ -1666,7 +1706,7 @@ static long check_cred_rule_cb(__u32 i, void *data)
     struct runtime_config *cfg;
     struct cred_event_ids ids;
     __u32 from_id = 0, want;
-    __u8 denied, status, constrained;
+    __u8 denied, status, constrained, warn;
 
     if (i >= ctx->count) return 1;
     index = 1 + i;
@@ -1696,8 +1736,11 @@ static long check_cred_rule_cb(__u32 i, void *data)
 
     ctx->matched = 1;
     cfg = bpf_map_lookup_elem(&runtime_config_map, &zero);
-    denied = r->deny && (!cfg || cfg->mode == MODE_ENFORCE);
-    status = r->deny && cfg && cfg->mode == MODE_WARN ? 'W' : r->deny ? 'F' : 'S';
+    /* Per-policy or host-wide; see check_rule_cb for why cfg == NULL still
+     * enforces. */
+    warn = ctx->warning || (cfg && cfg->mode == MODE_WARN);
+    denied = r->deny && !warn;
+    status = r->deny ? (warn ? 'W' : 'F') : 'S';
     if (!r->no_event) {
         ids.from_id = from_id;
         ids.to_id = to_id;
@@ -1767,6 +1810,7 @@ static __always_inline int check_cred_policy(const struct cred *new_cred,
     ctx = (struct cred_check_ctx){
         .inner = inner,
         .policy_id = meta->meta.id,
+        .warning = meta->meta.warning,
         .exec_path = self_img ? self_img->exe_path : 0,
         .delta = &delta,
         .exec_path_len = self_img ? self_img->path_len : 0,

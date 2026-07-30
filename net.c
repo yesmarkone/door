@@ -126,10 +126,19 @@ struct net_rule {
     __u16 port_max;
 };
 
+/* Slot 0 of every per-uid net policy. warning is door.c's struct policy_meta
+ * field, at the same offset and with the same meaning: the whole policy becomes
+ * observe-only, its deny rules reported 'W' and not enforced. See door.c for
+ * why it lives in the meta rather than on each rule, and why the last byte of
+ * id is not a usable home for it. */
 struct net_policy_meta {
     __u32 rule_count;
     char id[POLICY_ID_LEN]; /* NUL-terminated policy id */
+    __u8 warning;           /* 44 — deny rules report 'W' and are not enforced */
 };
+
+_Static_assert(__builtin_offsetof(struct net_policy_meta, warning) == 44,
+               "net_policy_meta.warning must stay at offset 44 (cmd/wdog/file.go)");
 
 /* Copied from door.c — the two objects must agree on these layouts byte for
  * byte, because they share the pinned maps holding them. See door.c for the
@@ -263,8 +272,18 @@ struct ingress_rule {
 struct ingress_meta {
     __u32 rule_count;
     char id[POLICY_ID_LEN];
+    __u8 warning;           /* 44 — deny rules report 'W' and are not enforced */
 };
 
+_Static_assert(__builtin_offsetof(struct ingress_meta, warning) == 44,
+               "ingress_meta.warning must stay at offset 44 (cmd/wdog/ingress.go)");
+
+/* The one policy space whose slot the meta's warning byte actually grew.
+ * Everywhere else the union is dominated by a rule struct hundreds of bytes
+ * wide, but ingress_meta and ingress_rule were both exactly 44, so the meta now
+ * sets the size. No ingress_rule field moved — only the map's value size, which
+ * cmd/wdog/ingress.go's kernelIngressSlot has to match. Both numbers are pinned
+ * below. */
 struct ingress_slot {
     union {
         struct ingress_meta meta;
@@ -302,7 +321,9 @@ _Static_assert(sizeof(struct net_rule) == 612, "struct net_rule must stay 612 by
 _Static_assert(sizeof(struct net_event) == 1472, "struct net_event must stay 1472 bytes");
 _Static_assert(sizeof(struct net_event) % 8 == 0, "zero_net_event needs a multiple of 8");
 _Static_assert(sizeof(struct ingress_rule) == 44, "struct ingress_rule must stay 44 bytes");
-_Static_assert(sizeof(struct ingress_slot) == 44, "struct ingress_slot must stay 44 bytes");
+/* 48, not the rule's 44: ingress_meta gained a warning byte at offset 44 and is
+ * now the wider member of the union. See struct ingress_slot. */
+_Static_assert(sizeof(struct ingress_slot) == 48, "struct ingress_slot must stay 48 bytes");
 
 /* Every inner policy map has this fixed layout: meta then the ordered rules. */
 struct {
@@ -916,6 +937,10 @@ struct net_check_ctx {
     __u8 exec_resolved; /* current process image was resolved via bpf_d_path */
     __u8 status;
     __u8 emit;
+    /* The deciding policy's observe-only flag; see struct net_policy_meta. Read
+     * once from the meta slot the caller already resolved, so unlike the
+     * runtime config it cannot be missing at decision time. */
+    __u8 warning;
     int result;
 };
 
@@ -936,7 +961,7 @@ static long check_net_rule_cb(__u32 i, void *data)
     struct net_policy_slot *slot;
     struct net_rule *r;
     struct net_runtime_config *cfg;
-    __u8 denied;
+    __u8 denied, warn;
 
     if (i >= ctx->count) return 1;
     index = 1 + i;
@@ -984,8 +1009,13 @@ static long check_net_rule_cb(__u32 i, void *data)
 
     ctx->matched = 1;
     cfg = bpf_map_lookup_elem(&net_runtime_config_map, &zero);
-    denied = r->deny && (!cfg || cfg->mode == MODE_ENFORCE);
-    ctx->status = r->deny && cfg && cfg->mode == MODE_WARN ? 'W' : r->deny ? 'F' : 'S';
+    /* Warn either because this policy is observe-only or because the whole host
+     * is. cfg == NULL still enforces, so a failed runtime_config lookup remains
+     * fail-closed for every policy that leaves warning clear; see door.c's
+     * check_rule_cb. */
+    warn = ctx->warning || (cfg && cfg->mode == MODE_WARN);
+    denied = r->deny && !warn;
+    ctx->status = r->deny ? (warn ? 'W' : 'F') : 'S';
     ctx->emit = !r->no_event;
     ctx->result = denied ? -13 /* EACCES */ : 0;
     return 1;   /* FIRST MATCH WINS */
@@ -1058,6 +1088,7 @@ static __always_inline int check_net_policy(const struct net_target *t, __u8 op,
         .t = t,
         .executable_path = executable_path,
         .policy_id = meta->meta.id,
+        .warning = meta->meta.warning,
         /* Two hash lookups per check, next to the bpf_d_path above that costs
          * considerably more. Policies with no name-scoped rules still pay them,
          * but never consult the result. */
@@ -1107,6 +1138,9 @@ struct ingress_ctx {
     __u8 matched;
     __u8 status;
     __u8 emit;
+    /* The ingress policy's observe-only flag; see struct ingress_meta. Filled
+     * from the meta slot check_ingress_policy reads before the loop. */
+    __u8 warning;
     int result;
 };
 
@@ -1120,7 +1154,7 @@ static long check_ingress_rule_cb(__u32 i, void *data)
     struct ingress_slot *slot;
     struct ingress_rule *r;
     struct net_runtime_config *cfg;
-    __u8 denied;
+    __u8 denied, warn;
 
     if (i >= ctx->count) return 1;
     index = 1 + i;
@@ -1139,13 +1173,17 @@ static long check_ingress_rule_cb(__u32 i, void *data)
 
     ctx->matched = 1;
     cfg = bpf_map_lookup_elem(&net_runtime_config_map, &zero);
-    denied = r->deny && (!cfg || cfg->mode == MODE_ENFORCE);
-    ctx->status = r->deny && cfg && cfg->mode == MODE_WARN ? 'W' : r->deny ? 'F' : 'S';
+    /* Warn either because this policy is observe-only or because the whole host
+     * is. cfg == NULL still enforces; see door.c's check_rule_cb. */
+    warn = ctx->warning || (cfg && cfg->mode == MODE_WARN);
+    denied = r->deny && !warn;
+    ctx->status = r->deny ? (warn ? 'W' : 'F') : 'S';
     ctx->emit = !r->no_event;
     /* Any non-zero return makes tcp_conn_request() drop the SYN. The client
      * sees a timeout rather than a refusal — there is no way to answer from
      * here, and staying silent is the conventional behaviour for a filtered
-     * port anyway. */
+     * port anyway. A warning policy therefore lets the connection complete and
+     * reports 'W', instead of the client seeing a timeout. */
     ctx->result = denied ? -13 /* EACCES */ : 0;
     return 1;   /* FIRST MATCH WINS */
 }
@@ -1189,6 +1227,7 @@ static __always_inline int check_ingress(struct ingress_ctx *ctx)
     ctx->count = meta->meta.rule_count;
     if (ctx->count > MAX_RULES) ctx->count = MAX_RULES;
     if (ctx->count == 0) return 0;
+    ctx->warning = meta->meta.warning;
 
     bpf_loop(MAX_RULES, check_ingress_rule_cb, ctx, 0);
     if (!ctx->matched || !ctx->emit) return ctx->result;
