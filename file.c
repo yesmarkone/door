@@ -30,7 +30,9 @@
 #define OP_EXEC    1
 #define OP_READ    2
 #define OP_WRITE   3
-/* Operations below are write-class: they are governed by the write rules. */
+/* Operations below change the filesystem. Most are governed by PERM_WRITE, but
+ * the two that make a name disappear — OP_UNLINK (unlink and rmdir) and
+ * OP_RENAME — are governed by PERM_DELETE instead. See op_perm_mask(). */
 #define OP_UNLINK  4
 #define OP_RENAME  5
 #define OP_CHMOD   6
@@ -52,6 +54,12 @@
  * gap between the process controls and the network codes in net.c. */
 #define OP_SETUID  16
 #define OP_SETGID  17
+/* Internal only, and never reported: the destination side of a rename. It
+ * exists solely to give that side a different permission mask from the source
+ * (see op_perm_mask), and check_policy normalizes it back to OP_RENAME before
+ * anything can observe it, so events carry 5 for both sides. 18-19 are the
+ * remainder of the gap before the network codes in net.c. */
+#define OP_RENAME_TO 18
 
 /* cred_rule::op_mask bits, the same kind of set proc_rule carries: one rule
  * covers the user switch, the group switch, or both. */
@@ -92,13 +100,56 @@
 #define MAX_CGROUP_DEPTH 32
 #define MODE_ENFORCE 0
 #define MODE_WARN    1
-/* Permission bits selecting which operations a rule governs. */
-#define PERM_EXEC  1
-#define PERM_READ  2
-#define PERM_WRITE 4
+/* Permission bits selecting which operations a rule governs.
+ *
+ * PERM_DELETE does not overlap PERM_WRITE: it was carved out of it. Making a
+ * name disappear — unlink, rmdir, and the source side of a rename — is judged
+ * by PERM_DELETE alone, so a rule carrying only PERM_WRITE no longer stops rm
+ * or mv. That is a deliberate break with the earlier behaviour, and the
+ * userspace loader warns about deny rules that look like they predate it; the
+ * old meaning is written as PERM_WRITE|PERM_DELETE (12).
+ *
+ * What PERM_DELETE is NOT is content destruction. truncate(), O_TRUNC and a
+ * plain overwrite leave the name in place and stay under PERM_WRITE. A rule
+ * that means to keep a file's contents intact needs the write bit. */
+#define PERM_EXEC   1
+#define PERM_READ   2
+#define PERM_WRITE  4
+#define PERM_DELETE 8
+
+/* The one place an operation is mapped to the permission bits that govern it.
+ * The result is a mask, not a single bit: a rule matches when it carries any of
+ * them, so the rename destination below is reachable from either axis.
+ *
+ * Called once per check from check_policy, outside bpf_loop, so the switch
+ * costs nothing the verifier cares about. */
+static __always_inline __u8 op_perm_mask(__u8 op)
+{
+    switch (op) {
+    case OP_EXEC:      return PERM_EXEC;
+    case OP_READ:      return PERM_READ;
+    /* OP_UNLINK is both unlink(2) and rmdir(2) — they share the op code, so
+     * there is no way to write a rule covering one but not the other. */
+    case OP_UNLINK:
+    /* The source side of a rename: the name goes away, exactly as with unlink. */
+    case OP_RENAME:    return PERM_DELETE;
+    /* The destination side is both things at once, and needs both bits for the
+     * same reason. Dropping PERM_WRITE would let `mv evil /etc/passwd` past a
+     * write-deny that stops it today, which is a retreat in write protection
+     * that has nothing to do with splitting delete out. Dropping PERM_DELETE
+     * would let a rename destroy the very file a delete-deny names, since
+     * renaming onto an existing name unlinks it. Fail closed on both.
+     *
+     * The cost is one false positive: a delete-deny also refuses a rename into
+     * the protected path that overwrites nothing. */
+    case OP_RENAME_TO: return PERM_WRITE | PERM_DELETE;
+    default:           return PERM_WRITE;
+    }
+}
 
 /* A rule matches when the current process image matches exec_path, the target
- * matches path, and the operation's permission bit is set. Patterns are stored
+ * matches path, and the rule's permission intersects the mask op_perm_mask()
+ * returns for the operation being judged. Patterns are stored
  * unescaped; the wild bitmaps mark which positions are '?'/'*' wildcards, so a
  * literal '*' or '?' byte (escaped in JSON) has its bit clear. An empty
  * pattern (leading NUL, bit 0 clear) always matches.
@@ -937,7 +988,10 @@ struct policy_check_ctx {
     __u32 path_len;
     __u32 exec_path_len;
     __u8 op;
-    __u8 perm_bit;
+    /* A mask, not a single bit — the rename destination demands
+     * PERM_WRITE|PERM_DELETE. net.c's identically-placed field really is one
+     * bit, which is why the names differ. */
+    __u8 perm_mask;
     __u8 matched;
     __u8 exec_resolved; /* current process image was resolved via bpf_d_path */
     int result;
@@ -962,7 +1016,9 @@ static long check_rule_cb(__u32 i, void *data)
     slot = bpf_map_lookup_elem(ctx->inner, &index);
     if (!slot || !slot->rule.enabled) return 0;
     r = &slot->rule;
-    if (!(r->permission & ctx->perm_bit)) return 0;
+    /* An intersection: the rule governs this operation if it carries any of the
+     * bits the operation demands. */
+    if (!(r->permission & ctx->perm_mask)) return 0;
     /* Scalars only, on purpose: see struct rule::employee_id. An unidentified
      * caller has EMPLOYEE_ID_ANY, so a rule scoped to anyone cannot match it. */
     if (r->employee_id != EMPLOYEE_ID_ANY && r->employee_id != ctx->employee_id)
@@ -1012,11 +1068,13 @@ static __always_inline int task_is_exempt(void)
  * are selected — and events attributed — by the audit login uid, which
  * pam_loginuid assigns at login and survives su/sudo, so a user stays under
  * their own policy after switching to root. The operation selects the
- * permission bit rules must carry: exec(1), read(2), or write(4) for every
- * write-class operation (write, truncate, unlink, rename, chmod, chown,
- * settime, mkdir, symlink, link, mknod). The first rule whose permission bit,
- * employee_id, exec_path pattern (current process image) and path pattern all
- * match decides the outcome.
+ * permission mask rules must intersect — see op_perm_mask(): exec(1); read(2);
+ * delete(8) for unlink, rmdir and the source side of a rename;
+ * write(4)|delete(8) for the destination side of a rename; write(4) for every
+ * other filesystem change (write, truncate, chmod, chown, settime, mkdir,
+ * symlink, link, mknod). The first rule whose permission mask, employee_id,
+ * exec_path pattern (current process image) and path pattern all match decides
+ * the outcome.
  *
  * The employee is the second user axis: the login uid picks the policy, the
  * employee picks which of its rules apply. That is what makes a shared account —
@@ -1088,9 +1146,11 @@ static __always_inline int check_policy(const char *path, __u32 path_len, __u8 o
         .count = count,
         .path_len = path_len,
         .exec_path_len = exec_path_len,
-        .op = op,
-        .perm_bit = op == OP_EXEC ? PERM_EXEC :
-                    op == OP_READ ? PERM_READ : PERM_WRITE,
+        /* OP_RENAME_TO exists only to pick a different mask below. Normalize it
+         * here, before anything can read ctx.op, so both sides of a rename are
+         * reported with the one operation code userspace knows. */
+        .op = op == OP_RENAME_TO ? OP_RENAME : op,
+        .perm_mask = op_perm_mask(op),
         .exec_resolved = exec_resolved,
     };
     bpf_loop(MAX_RULES, check_rule_cb, &ctx, 0);
@@ -1129,7 +1189,7 @@ static __always_inline int check(struct file *file, __u8 op)
 }
 
 /* Resolve "parent directory path" + "/" + "dentry name" into the shared path
- * scratch and run the write-class policy on it. Used by
+ * scratch and run the policy on it. Used by
  * unlink/rmdir/mkdir/symlink/link/mknod/rename,
  * whose hooks receive the target as a (parent path, dentry) pair. */
 static __always_inline int check_dir_dentry(const struct path *dir,
@@ -1813,12 +1873,17 @@ long BPF_PROG(check_file_open, struct file *file, int ret)
 SEC("lsm/path_unlink")
 long BPF_PROG(check_path_unlink, const struct path *dir, struct dentry *dentry)
 {
+    /* delete(8), not write(4). A rule carrying only the write bit does not
+     * stop this. */
     return lsm_ret(check_dir_dentry(dir, dentry, OP_UNLINK));
 }
 
 SEC("lsm/path_rmdir")
 long BPF_PROG(check_path_rmdir, const struct path *dir, struct dentry *dentry)
 {
+    /* Shares OP_UNLINK with file deletion above, so one delete rule covers both
+     * and neither can be written without the other. Reported as operation 4
+     * either way, which is also why a consumer cannot tell rm from rmdir. */
     return lsm_ret(check_dir_dentry(dir, dentry, OP_UNLINK));
 }
 
@@ -1865,12 +1930,14 @@ SEC("lsm/path_rename")
 long BPF_PROG(check_path_rename, const struct path *old_dir, struct dentry *old_dentry,
              const struct path *new_dir, struct dentry *new_dentry)
 {
-    /* Both sides are writes: moving a file out of a protected directory and
-     * moving one in are each subject to the write rules. */
+    /* Both sides are checked, with different masks. The source loses a name, so
+     * it is judged as a delete; the destination gains one and may destroy what
+     * was already there, so it is judged as both a write and a delete. See
+     * op_perm_mask(). Either side denying blocks the rename. */
     int ret = check_dir_dentry(old_dir, old_dentry, OP_RENAME);
 
     if (ret) return lsm_ret(ret);
-    return lsm_ret(check_dir_dentry(new_dir, new_dentry, OP_RENAME));
+    return lsm_ret(check_dir_dentry(new_dir, new_dentry, OP_RENAME_TO));
 }
 
 SEC("lsm/path_chmod")
@@ -1892,7 +1959,11 @@ long BPF_PROG(check_path_truncate, const struct path *path)
      * file_open(FMODE_WRITE) does not see it. Governing it here closes a
      * write-class bypass that would otherwise let a protected file be zeroed
      * without matching any rule. (ftruncate(fd) is already covered by
-     * file_open, and O_TRUNC opens carry FMODE_WRITE there too.) */
+     * file_open, and O_TRUNC opens carry FMODE_WRITE there too.)
+     *
+     * This stays write(4) on purpose. Truncation destroys contents but leaves
+     * the name, so delete(8) does not stop it — a rule that means to keep a
+     * file intact, not merely present, must carry the write bit. */
     return lsm_ret(check_path_op(path, OP_TRUNCATE));
 }
 
