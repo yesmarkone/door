@@ -19,15 +19,34 @@
 // libbpf (and through it zlib and elfutils) is a liability there, and it would
 // make libbpf a runtime requirement on every deployed host. See pam/Makefile.
 //
-// Placement in the stack matters:
+// Placement in the stack matters, and so does the control flag:
 //
 //     session    required   pam_loginuid.so
-//     session    optional   pam_wood.so
+//     session    required   pam_wood.so
 //
 // pam_loginuid.so is what assigns the audit session id, so this module must run
 // after it; before it, /proc/self/sessionid still reads -1 and there is nothing
-// to key on. It is `optional` because nothing here is worth failing a login
-// over — every path below returns PAM_SUCCESS and reports trouble to syslog.
+// to key on.
+//
+// `required`, because a login this module cannot identify is refused:
+// open_session returns PAM_SESSION_ERR when the variable naming the person is
+// unset or empty. That is the one path here that fails a login. Everything else
+// that can go wrong — no audit session id yet, no pin to write to, a full map —
+// still returns PAM_SUCCESS and only reports to syslog. Those leave the session
+// unidentified, and an unidentified session is either already contained by the
+// catch-all deny rule the policy carries, or wdog is down and there is no policy
+// to enforce at all, in which case refusing logins buys nothing and costs an
+// outage. An unset variable is different in kind: the front-end module that was
+// supposed to say who is arriving never did, and there is nothing to fall back
+// on — so the account is not being used as the audit trail requires.
+//
+// The control flag decides what that return code costs, so `optional` restores
+// the previous never-fail behaviour verbatim. An account that must survive a
+// broken identification path (root, for recovery) belongs in the stack rather
+// than in an option here:
+//
+//     session    [success=1 default=ignore]   pam_succeed_if.so user = root quiet
+//     session    required                     pam_wood.so
 
 #include <errno.h>
 #include <fcntl.h>
@@ -67,7 +86,9 @@ struct options {
 	int debug;
 	/* fallback_user makes an absent environment variable fall back to the
 	 * login account name. Off by default: recording the account as the person
-	 * would make the audit trail assert something PAM was never told. */
+	 * would make the audit trail assert something PAM was never told. Note
+	 * that it also keeps the module from ever refusing a session — a login
+	 * always has an account name, so the name is never missing. */
 	int fallback_user;
 };
 
@@ -153,11 +174,7 @@ int pam_sm_open_session(pam_handle_t *pamh, int flags, int argc, const char **ar
 	(void)flags;
 	parse_options(&o, argc, argv);
 
-	/* test only */	
-	pam_putenv(pamh, "PAM_EMPLOYEE_NAME=mark1");
-
 	name = pam_getenv(pamh, o.env_name);
-	pam_syslog(pamh, LOG_WARNING, "===1 %s", name);
 	if ((!name || !*name) && o.fallback_user) {
 		const char *user = NULL;
 
@@ -165,14 +182,21 @@ int pam_sm_open_session(pam_handle_t *pamh, int flags, int argc, const char **ar
 			name = user;
 	}
 	if (!name || !*name) {
-		/* Nothing to record. Rules naming an employee then match nothing for
-		 * this session, which is the documented behaviour rather than a
-		 * failure — but say so once, since a whole stack misconfigured this
-		 * way would otherwise look like the policy silently not working. */
-		if (o.debug)
-			pam_syslog(pamh, LOG_DEBUG, "%s is unset; session recorded with no employee name",
-				   o.env_name);
-		return PAM_SUCCESS;
+		/* Nobody said who this is, so refuse the session: an account reached
+		 * this way would run entirely outside the per-person policy, which is
+		 * the whole reason the module is installed. LOG_ERR unconditionally,
+		 * not under debug — with `required` this is now the reason a login was
+		 * turned away, and with `optional` it is a stack that silently records
+		 * nobody. Both need to be visible without turning debug on. */
+		pam_syslog(pamh, LOG_ERR,
+			   "%s is unset; refusing the session (the module that sets it must run before pam_wood.so; use `optional` here to let such logins through unidentified)",
+			   o.env_name);
+		/* Best effort: sshd relays this to the client on most builds, and where
+		 * it does not, the syslog line above is what remains. Deliberately says
+		 * nothing about which variable or module is missing — that is an
+		 * operator's business, not the person being turned away. */
+		pam_error(pamh, "Login denied: this account requires an identified user.");
+		return PAM_SESSION_ERR;
 	}
 
 	sid = current_session_id();
@@ -212,12 +236,10 @@ int pam_sm_open_session(pam_handle_t *pamh, int flags, int argc, const char **ar
 	attr.key = (uint64_t)(unsigned long)&key;
 	attr.value = (uint64_t)(unsigned long)&id;
 	attr.flags = BPF_ANY;
-	pam_syslog(pamh, LOG_WARNING, "===2 %s", name);
 	if (bpf(BPF_MAP_UPDATE_ELEM, &attr) < 0) {
 		/* E2BIG is the map being full: sessions have accumulated faster than
 		 * they were reaped. Worth naming, because from here on no new login
 		 * can be identified at all. */
-		pam_syslog(pamh, LOG_WARNING, "===3 %s", name);
 		if (errno == E2BIG)
 			pam_syslog(pamh, LOG_ERR,
 				   "%s is full; new logins cannot be identified until entries are freed",
@@ -225,11 +247,9 @@ int pam_sm_open_session(pam_handle_t *pamh, int flags, int argc, const char **ar
 		else
 			pam_syslog(pamh, LOG_INFO, "recording session %ld: %m", sid);
 	} else if (o.debug) {
-		pam_syslog(pamh, LOG_WARNING, "===4 %s", name);
 		pam_syslog(pamh, LOG_INFO, "session %ld (uid %ld) recorded as %s",
 			   sid, uid, id.employee_name);
 	}
-	pam_syslog(pamh, LOG_WARNING, "===5 %s", name);
 	close(fd);
 	return PAM_SUCCESS;
 }
