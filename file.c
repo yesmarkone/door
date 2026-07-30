@@ -194,11 +194,13 @@ _Static_assert(sizeof(struct proc_rule) == 608, "struct proc_rule must stay 608 
  * written against that would be perfectly formed and never match. The old real
  * id is reported on the event instead, where it says which hop tripped the rule.
  *
- * to_uid/to_gid match an id the task is NEWLY ACQUIRING — present in the new
- * credentials and absent from the old ones, across all four id slots. Matching
- * the real uid alone would miss a process that retains a saved uid and later
- * calls seteuid(0); requiring the id to be newly acquired is also what keeps
- * the no-op calls sudo makes by the dozen from matching anything.
+ * to_uid/to_gid match an id this call MOVES A SLOT TO — compared slot by slot
+ * against the old credentials, so a rule catches both the real-uid move su
+ * makes and the effective-uid move of a process that kept a saved uid and later
+ * calls seteuid(0). Slots that do not move are ignored, which is what keeps the
+ * no-op calls sudo makes by the dozen from matching anything. See
+ * struct cred_id_delta for why this is slot-wise rather than "an id the task
+ * did not already hold".
  *
  * exec_path cannot come from bpf_d_path — the helper is rejected at the
  * credential hooks exactly as it is at task_kill — so it is read out of
@@ -311,10 +313,12 @@ struct event {
     __u32 ppid;
     __u32 cmdline_len;
     char cmdline[CMDLINE_LEN];
-    /* OP_SETUID/OP_SETGID only. to_id is the identity being acquired — what the
-     * rule matched on. from_id is the old credentials' real id and is
-     * diagnostic: on a multi-step switch such as sudo's it says which hop
-     * tripped the rule. Who the person is, is uid, the login uid above.
+    /* OP_SETUID/OP_SETGID only, and both describe the SAME id slot: the one
+     * this call moved that the rule matched on. to_id is where it landed —
+     * what the rule named — and from_id what that slot held before, which on a
+     * multi-step switch such as sudo's says which hop tripped the rule. Drawing
+     * the two from different slots would render an effective-uid change of
+     * 1 -> 0 as "0 -> 0". Who the person is, is uid, the login uid above.
      *
      * These two went on the end rather than into the tail padding because there
      * were only four spare bytes there and this needs eight. The record's
@@ -1511,54 +1515,80 @@ long BPF_PROG(check_ptrace_access, struct task_struct *child, unsigned int mode)
  * sides so they can be compared positionally: real, effective, saved, fs. */
 #define CRED_ID_SLOTS 4
 
-/* Which of the new credential's ids the task did not already hold. Positional
- * rather than compacted — gained[i] qualifies ids[i] — because a variable-index
- * write into a stack array is exactly the kind of thing the verifier makes
- * expensive, and matching four slots twice costs less than avoiding it.
- * Duplicates are harmless: the same id in two slots is simply tested twice. */
-struct acquired_ids {
-    __u32 ids[CRED_ID_SLOTS];
-    __u8 gained[CRED_ID_SLOTS];
+/* Which slots this call actually moves, and what they move to. Positional —
+ * changed[i] qualifies ids[i] — so no compaction and no variable-index write
+ * into a stack array, which is the kind of thing the verifier makes expensive.
+ * The same id landing in two slots is simply tested twice, which is harmless.
+ *
+ * SLOT-WISE, not "an id the task did not already hold anywhere". The difference
+ * is the whole reason a rule against uid 0 works at all. su and sudo are
+ * setuid-root binaries, so execve already put 0 in euid, suid and fsuid before
+ * either of them runs a line of code; their later setuid(0) therefore acquires
+ * nothing the task did not hold, and a rule matching only unheld ids would sit
+ * there looking enforced while root was reached anyway (measured: `su root`
+ * succeeded under a toUserID:0 deny, with no event). Comparing each slot to its
+ * own previous value catches the real-uid move 1000 -> 0 that su performs.
+ *
+ * Nothing is lost by the change: an id absent from every old slot is by
+ * definition absent from its own, so the old matches are a subset of these. The
+ * no-op calls stay filtered, which is what keeps sudo's permission state
+ * machine from flooding the ring buffer. */
+struct cred_id_delta {
+    __u32 ids[CRED_ID_SLOTS];   /* what each slot becomes */
+    __u32 was[CRED_ID_SLOTS];   /* what it held before */
+    __u8 changed[CRED_ID_SLOTS];
     __u8 any;
 };
 
-static __always_inline void acquired_ids_diff(struct acquired_ids *out,
-                                              const __u32 *new_ids,
-                                              const __u32 *old_ids)
+static __always_inline void cred_id_delta_of(struct cred_id_delta *out,
+                                             const __u32 *new_ids,
+                                             const __u32 *old_ids)
 {
     out->any = 0;
 #pragma unroll
     for (int i = 0; i < CRED_ID_SLOTS; i++) {
-        __u8 held = 0;
+        __u8 changed = old_ids[i] != new_ids[i];
 
         out->ids[i] = new_ids[i];
-#pragma unroll
-        for (int j = 0; j < CRED_ID_SLOTS; j++)
-            if (old_ids[j] == new_ids[i]) held = 1;
-        out->gained[i] = !held;
-        if (!held) out->any = 1;
+        out->was[i] = old_ids[i];
+        out->changed[i] = changed;
+        if (changed) out->any = 1;
     }
 }
 
-/* The id to report when a rule that named none matched: the first slot the task
- * actually gained, in real/effective/saved/fs order. */
-static __always_inline __u32 primary_acquired(const struct acquired_ids *a)
+/* Decide whether this call moves a slot the rule cares about, and describe that
+ * one slot. When the rule names a destination it must be a slot that moved TO
+ * it; when it names none, the first slot that moved at all — real, effective,
+ * saved, fs, in that order.
+ *
+ * from and to come from the SAME slot on purpose. Reporting the old real uid
+ * next to whichever id matched would render an effective-uid change of 1 -> 0
+ * as "from_uid=0 to_uid=0", which reads as no change at all. */
+static __always_inline __u8 delta_pick(const struct cred_id_delta *d,
+                                       __u8 constrained, __u32 want,
+                                       __u32 *from, __u32 *to)
 {
+    __u8 found = 0;
+
 #pragma unroll
-    for (int i = 0; i < CRED_ID_SLOTS; i++)
-        if (a->gained[i]) return a->ids[i];
-    return a->ids[0];
+    for (int i = 0; i < CRED_ID_SLOTS; i++) {
+        if (found || !d->changed[i]) continue;
+        if (constrained && d->ids[i] != want) continue;
+        found = 1;
+        *from = d->was[i];
+        *to = d->ids[i];
+    }
+    return found;
 }
 
 struct cred_check_ctx {
     void *inner;
     const char *policy_id;
     const char *exec_path;      /* the switching process's image, or NULL */
-    const struct acquired_ids *acquired;
+    const struct cred_id_delta *delta;
     __u32 exec_path_len;
     __u32 uid;                  /* login uid; the policy key and the event's */
     __u32 employee_id;
-    __u32 from_id;              /* old real uid/gid, for the event only */
     __u32 count;
     __u8 op;                    /* OP_SETUID or OP_SETGID */
     __u8 op_bit;                /* the same, as the CRED_OP_*_BIT a rule matches */
@@ -1575,7 +1605,8 @@ static long check_cred_rule_cb(__u32 i, void *data)
     struct cred_rule *r;
     struct runtime_config *cfg;
     struct cred_event_ids ids;
-    __u8 denied, status, constrained, want_match = 0;
+    __u32 from_id = 0, want;
+    __u8 denied, status, constrained;
 
     if (i >= ctx->count) return 1;
     index = 1 + i;
@@ -1591,16 +1622,8 @@ static long check_cred_rule_cb(__u32 i, void *data)
     /* Cheapest first: the destination id is four scalar compares, the employee
      * one more, and only then the single pattern scan. */
     constrained = ctx->op == OP_SETUID ? r->has_to_uid : r->has_to_gid;
-    if (constrained) {
-        to_id = ctx->op == OP_SETUID ? r->to_uid : r->to_gid;
-#pragma unroll
-        for (int j = 0; j < CRED_ID_SLOTS; j++)
-            if (ctx->acquired->gained[j] && ctx->acquired->ids[j] == to_id)
-                want_match = 1;
-        if (!want_match) return 0;
-    } else {
-        to_id = primary_acquired(ctx->acquired);
-    }
+    want = ctx->op == OP_SETUID ? r->to_uid : r->to_gid;
+    if (!delta_pick(ctx->delta, constrained, want, &from_id, &to_id)) return 0;
     if (r->employee_id != EMPLOYEE_ID_ANY && r->employee_id != ctx->employee_id)
         return 0;
 
@@ -1616,7 +1639,7 @@ static long check_cred_rule_cb(__u32 i, void *data)
     denied = r->deny && (!cfg || cfg->mode == MODE_ENFORCE);
     status = r->deny && cfg && cfg->mode == MODE_WARN ? 'W' : r->deny ? 'F' : 'S';
     if (!r->no_event) {
-        ids.from_id = ctx->from_id;
+        ids.from_id = from_id;
         ids.to_id = to_id;
         ids.flags = ctx->setid_flags;
         /* No path: nothing is being acted on but the task's own identity. The
@@ -1634,7 +1657,7 @@ static __always_inline int check_cred_policy(const struct cred *new_cred,
 {
     __u32 uid, zero = 0, count;
     __u32 new_ids[CRED_ID_SLOTS], old_ids[CRED_ID_SLOTS];
-    struct acquired_ids acquired;
+    struct cred_id_delta delta;
     struct task_struct *task;
     struct cred_policy_slot *meta;
     struct cred_check_ctx ctx;
@@ -1663,12 +1686,12 @@ static __always_inline int check_cred_policy(const struct cred *new_cred,
         old_ids[2] = BPF_CORE_READ(old_cred, sgid.val);
         old_ids[3] = BPF_CORE_READ(old_cred, fsgid.val);
     }
-    acquired_ids_diff(&acquired, new_ids, old_ids);
+    cred_id_delta_of(&delta, new_ids, old_ids);
     /* Before the map lookup on purpose. The kernel calls these hooks on every
      * setuid-family syscall including the ones that change nothing, and sudo
-     * alone makes a dozen of those per run; a task that gains no identity has
-     * nothing any rule here can be about. */
-    if (!acquired.any) return 0;
+     * alone makes a dozen of those per run; a call that moves no slot cannot be
+     * what any rule here is about. */
+    if (!delta.any) return 0;
 
     task = (struct task_struct *)bpf_get_current_task_btf();
     uid = BPF_CORE_READ(task, loginuid.val);
@@ -1685,11 +1708,10 @@ static __always_inline int check_cred_policy(const struct cred *new_cred,
         .inner = inner,
         .policy_id = meta->meta.id,
         .exec_path = self_img ? self_img->exe_path : 0,
-        .acquired = &acquired,
+        .delta = &delta,
         .exec_path_len = self_img ? self_img->path_len : 0,
         .uid = uid,
         .employee_id = current_employee_id(task, uid),
-        .from_id = old_ids[0],
         .count = count,
         .op = op,
         .op_bit = op_bit,
