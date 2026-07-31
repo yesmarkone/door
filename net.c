@@ -127,7 +127,10 @@ struct net_rule {
     __u8 protocol;      /* 0=any, IPPROTO_* */
     __u8 sock_type;     /* 0=any, SOCK_STREAM 1, SOCK_DGRAM 2, SOCK_RAW 3 */
     __u8 prefix_len;    /* 0..128, or NET_ANY_PREFIX */
-    __u8 _pad[2];
+    /* This one rule is observe-only; see door.c's struct policy_meta for the
+     * three scopes. Came out of the tail padding, so port_min did not move. */
+    __u8 warn;
+    __u8 _pad[1];
     __u16 port_min;     /* host byte order, inclusive */
     __u16 port_max;
 };
@@ -279,7 +282,12 @@ struct ingress_rule {
     __u8 protocol;          /* 0=any, IPPROTO_TCP 6; only TCP arrives here today */
     __u8 src_prefix_len;    /* 0..128, or NET_ANY_PREFIX */
     __u8 local_prefix_len;
-    __u8 _pad;
+    /* This one rule is observe-only; see door.c's struct policy_meta. It took
+     * the last padding byte, so port_min did not move but the struct is now
+     * exactly full: the next flag grows it to 46. That still fits the 48-byte
+     * slot the meta already sets, so unlike cred_rule it would NOT be caught by
+     * a value-size mismatch — only by the assert below. */
+    __u8 warn;
     __u16 port_min;         /* local (listening) port, host byte order */
     __u16 port_max;
 };
@@ -333,6 +341,11 @@ struct net_cgroup_scratch {
  * pins the sizes in net_test.go, so a silent layout change here would corrupt
  * policy and events rather than fail to build. */
 _Static_assert(sizeof(struct net_rule) == 612, "struct net_rule must stay 612 bytes");
+/* sizeof cannot catch two adjacent __u8s swapping places, and deny, no_event and
+ * warn are now three indistinguishable bytes whose meanings are not
+ * interchangeable. Same treatment as door.c's struct rule. */
+_Static_assert(__builtin_offsetof(struct net_rule, warn) == 606,
+               "net_rule.warn must stay at offset 606 (cmd/wdog/net.go)");
 _Static_assert(sizeof(struct net_event) == 1472, "struct net_event must stay 1472 bytes");
 _Static_assert(sizeof(struct net_event) % 8 == 0, "zero_net_event needs a multiple of 8");
 /* rule_slot took over a hole that already existed, which is why the 1472 above
@@ -342,6 +355,8 @@ _Static_assert(sizeof(struct net_event) % 8 == 0, "zero_net_event needs a multip
 _Static_assert(__builtin_offsetof(struct net_event, rule_slot) == 84,
                "net_event.rule_slot must stay at offset 84 (cmd/wdog/net_test.go)");
 _Static_assert(sizeof(struct ingress_rule) == 44, "struct ingress_rule must stay 44 bytes");
+_Static_assert(__builtin_offsetof(struct ingress_rule, warn) == 39,
+               "ingress_rule.warn must stay at offset 39 (cmd/wdog/ingress.go)");
 /* 48, not the rule's 44: ingress_meta gained a warning byte at offset 44 and is
  * now the wider member of the union. See struct ingress_slot. */
 _Static_assert(sizeof(struct ingress_slot) == 48, "struct ingress_slot must stay 48 bytes");
@@ -1036,11 +1051,11 @@ static long check_net_rule_cb(__u32 i, void *data)
 
     ctx->matched = 1;
     cfg = bpf_map_lookup_elem(&net_runtime_config_map, &zero);
-    /* Warn either because this policy is observe-only or because the whole host
-     * is. cfg == NULL still enforces, so a failed runtime_config lookup remains
-     * fail-closed for every policy that leaves warning clear; see door.c's
-     * check_rule_cb. */
-    warn = ctx->warning || (cfg && cfg->mode == MODE_WARN);
+    /* Warn because this rule is observe-only, or this policy is, or the whole
+     * host is. cfg == NULL still enforces, so a failed runtime_config lookup
+     * remains fail-closed for every rule that leaves both flags clear; see
+     * door.c's check_rule_cb. */
+    warn = r->warn || ctx->warning || (cfg && cfg->mode == MODE_WARN);
     denied = r->deny && !warn;
     ctx->status = r->deny ? (warn ? 'W' : 'F') : 'S';
     ctx->emit = !r->no_event;
@@ -1210,9 +1225,9 @@ static long check_ingress_rule_cb(__u32 i, void *data)
 
     ctx->matched = 1;
     cfg = bpf_map_lookup_elem(&net_runtime_config_map, &zero);
-    /* Warn either because this policy is observe-only or because the whole host
-     * is. cfg == NULL still enforces; see door.c's check_rule_cb. */
-    warn = ctx->warning || (cfg && cfg->mode == MODE_WARN);
+    /* Warn because this rule is observe-only, or this policy is, or the whole
+     * host is. cfg == NULL still enforces; see door.c's check_rule_cb. */
+    warn = r->warn || ctx->warning || (cfg && cfg->mode == MODE_WARN);
     denied = r->deny && !warn;
     ctx->status = r->deny ? (warn ? 'W' : 'F') : 'S';
     ctx->emit = !r->no_event;
@@ -1220,7 +1235,8 @@ static long check_ingress_rule_cb(__u32 i, void *data)
     /* Any non-zero return makes tcp_conn_request() drop the SYN. The client
      * sees a timeout rather than a refusal — there is no way to answer from
      * here, and staying silent is the conventional behaviour for a filtered
-     * port anyway. A warning policy therefore lets the connection complete and
+     * port anyway. A warned rule — whether by its own warn flag, its policy's
+     * warning, or the global mode — therefore lets the connection complete and
      * reports 'W', instead of the client seeing a timeout. */
     ctx->result = denied ? -13 /* EACCES */ : 0;
     return 1;   /* FIRST MATCH WINS */

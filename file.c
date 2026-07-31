@@ -191,13 +191,22 @@ struct rule {
     __u8 no_event;
     __u8 exec_suffix_len;
     __u8 path_suffix_len;
-    __u8 _pad[2];
+    /* This one rule is observe-only; see struct policy_meta::warning for the
+     * three scopes and how they combine. Came out of the tail padding, so no
+     * field moved and the size below did not change. */
+    __u8 warn;
+    __u8 _pad[1];
 };
 
 /* The userspace loader writes this by byte offset (cmd/wdog/file.go) and
  * file_test.go pins the size, so a silent layout change here would apply policy
  * to the wrong fields rather than fail to build. */
 _Static_assert(sizeof(struct rule) == 588, "struct rule must stay 588 bytes");
+/* sizeof alone cannot catch two adjacent __u8s swapping places, and deny,
+ * no_event and warn are now three indistinguishable bytes in a row whose
+ * meanings are not interchangeable. Pin the one that was added last. */
+_Static_assert(__builtin_offsetof(struct rule, warn) == 586,
+               "rule.warn must stay at offset 586 (cmd/wdog/file.go)");
 
 /* A signal rule. Deliberately not struct rule: the thing being acted on is
  * another process, so the constraints describe a task rather than a path.
@@ -230,12 +239,16 @@ struct proc_rule {
     __u8 target_suffix_len;         /* 601 */
     __u8 op_mask;                   /* 602 — PROC_OP_*_BIT; which ops this covers */
     __u8 ptrace_mode;               /* 603 — OP_PTRACE only; 0 = any mode */
-    __u8 _pad[4];                   /* 604 */
+    __u8 warn;                      /* 604 — this rule alone is observe-only */
+    __u8 _pad[3];                   /* 605 */
 };                                  /* 608 */
 
 /* The two bytes came out of the tail padding, so the process controls did not
- * move a single field of the file rule they were modelled on. */
+ * move a single field of the file rule they were modelled on. warn later came
+ * out of the same padding, on the same terms. */
 _Static_assert(sizeof(struct proc_rule) == 608, "struct proc_rule must stay 608 bytes");
+_Static_assert(__builtin_offsetof(struct proc_rule, warn) == 604,
+               "proc_rule.warn must stay at offset 604 (cmd/wdog/file.go)");
 
 /* A credential-switch rule: the task changing its OWN user or group identity,
  * which is what su and sudo do once they are running.
@@ -275,20 +288,38 @@ struct cred_rule {
     __u8 deny;                      /* 304 */
     __u8 no_event;                  /* 305 */
     __u8 exec_suffix_len;           /* 306 */
-    __u8 _pad[1];                   /* 307 */
+    __u8 warn;                      /* 307 — this rule alone is observe-only */
 };                                  /* 308 */
 
+/* warn took the last padding byte: 308 is 4·77 and employee_id forces 4-byte
+ * alignment, so the struct is now exactly full. The next flag added here costs
+ * four bytes, not one, and that does change the map's value size — which the
+ * loader's Put will reject outright rather than accept silently. */
 _Static_assert(sizeof(struct cred_rule) == 308, "struct cred_rule must stay 308 bytes");
+_Static_assert(__builtin_offsetof(struct cred_rule, warn) == 307,
+               "cred_rule.warn must stay at offset 307 (cmd/wdog/file.go)");
 
 /* Slot 0 of every inner policy map. warning makes the whole policy
  * observe-only: its deny rules are allowed through and reported 'W' instead of
- * 'F'. It is the per-policy twin of runtime_config::mode, and the two are OR'd
- * at each decision site.
+ * 'F'.
  *
- * It lives here rather than in each rule because it describes the policy, not
- * the rule — putting it on struct rule would replicate one bit across up to
- * MAX_RULES slots, and would have to find spare padding in four differently
- * shaped rule structs. Here one offset serves all five policy spaces.
+ * Observe-only has three scopes, and each site OR's all three:
+ *
+ *     runtime_config::mode   the whole host   — the emergency full release
+ *     policy_meta::warning   one policy       — this field
+ *     struct rule::warn      one rule         — the per-rule twin
+ *
+ * The verdict is identical whichever fires; only the blast radius differs. OR
+ * and not override, in both directions: a rule cannot re-enforce itself under a
+ * warning policy, and neither can hold out against `mode warn`, because that
+ * switch has to stay a release of *everything* for the operator reaching for it
+ * mid-incident. See docs/policy.md.
+ *
+ * This one stays in the meta rather than moving onto each rule. It describes the
+ * policy, so a rule copy would replicate one bit across up to MAX_RULES slots
+ * and say nothing the per-rule flag does not already say better. Here one offset
+ * serves all five policy spaces, which is what lets a single loader function
+ * write it everywhere (cmd/wdog/file.go's putMeta).
  *
  * Do not fold it into the last byte of id. POLICY_ID_LEN is 40 while the loader
  * writes at most 39 characters, so byte 43 looks free, but it is the NUL
@@ -1103,12 +1134,16 @@ static long check_rule_cb(__u32 i, void *data)
 
     ctx->matched = 1;
     cfg = bpf_map_lookup_elem(&runtime_config_map, &zero);
-    /* Warn either because this policy is observe-only or because the whole host
-     * is. Note what this does NOT change: cfg == NULL still enforces, so a
-     * failed runtime_config lookup remains fail-closed for every policy that
-     * leaves warning clear. The policy flag is safe to trust here because it
-     * came from a meta slot check_policy already read successfully. */
-    warn = ctx->warning || (cfg && cfg->mode == MODE_WARN);
+    /* Warn because this rule is observe-only, or this policy is, or the whole
+     * host is — three scopes of one switch, OR'd. See struct policy_meta.
+     *
+     * Note what this does NOT change: cfg == NULL still enforces, so a failed
+     * runtime_config lookup remains fail-closed for every rule that leaves both
+     * flags clear. Neither flag opens a new lookup-failure path: ctx->warning
+     * came from a meta slot check_policy already read successfully, and r->warn
+     * from the rule slot looked up at the top of this callback. Only the runtime
+     * config can be missing at decision time, and only it is guarded. */
+    warn = r->warn || ctx->warning || (cfg && cfg->mode == MODE_WARN);
     denied = r->deny && !warn;
     status = r->deny ? (warn ? 'W' : 'F') : 'S';
     if (!r->no_event) {
@@ -1534,9 +1569,9 @@ static long check_proc_rule_cb(__u32 i, void *data)
 
     ctx->matched = 1;
     cfg = bpf_map_lookup_elem(&runtime_config_map, &zero);
-    /* Per-policy or host-wide; see check_rule_cb for why cfg == NULL still
-     * enforces. */
-    warn = ctx->warning || (cfg && cfg->mode == MODE_WARN);
+    /* Per-rule, per-policy or host-wide; see check_rule_cb for why cfg == NULL
+     * still enforces. */
+    warn = r->warn || ctx->warning || (cfg && cfg->mode == MODE_WARN);
     denied = r->deny && !warn;
     status = r->deny ? (warn ? 'W' : 'F') : 'S';
     if (!r->no_event)
@@ -1770,9 +1805,9 @@ static long check_cred_rule_cb(__u32 i, void *data)
 
     ctx->matched = 1;
     cfg = bpf_map_lookup_elem(&runtime_config_map, &zero);
-    /* Per-policy or host-wide; see check_rule_cb for why cfg == NULL still
-     * enforces. */
-    warn = ctx->warning || (cfg && cfg->mode == MODE_WARN);
+    /* Per-rule, per-policy or host-wide; see check_rule_cb for why cfg == NULL
+     * still enforces. */
+    warn = r->warn || ctx->warning || (cfg && cfg->mode == MODE_WARN);
     denied = r->deny && !warn;
     status = r->deny ? (warn ? 'W' : 'F') : 'S';
     if (!r->no_event) {
