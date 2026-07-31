@@ -25,7 +25,7 @@
  * it is what makes the rule loop verifiable. Comparing a name here means
  * branching on a pointer whose null-ness the verifier cannot know, and that
  * fork doubles the exploration of both glob matchers below it; measured on
- * RHEL 9 (5.14), it put check_net_sendmsg in net.c past the one-million
+ * RHEL 9 (5.14), it put wax_check_sendmsg in net.c past the one-million
  * instruction ceiling and the object stopped loading. A scalar compare costs
  * nothing. The loader interns each distinct name to an id and publishes the
  * mapping in employee_ids, which check_policy consults once per check —
@@ -318,7 +318,7 @@ struct pending_exec_event {
     char file[PATH_LEN];
     char executable_path[PATH_LEN];
     char policy_id[POLICY_ID_LEN];
-    /* Carried to emit_committed_exec so a staged exec reports the same rule an
+    /* Carried to wax_emit_exec so a staged exec reports the same rule an
      * inline decision would. queue_exec_event takes it as a required argument
      * rather than defaulting it, because the percpu scratch this is staged
      * through is not cleared between execs — an unset field would report the

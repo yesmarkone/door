@@ -20,7 +20,7 @@ struct net_rule {
     __u8 path_wild[PATH_LEN / 8];
     /* The second user axis, alongside the login uid that selected the policy.
      * An interned id rather than the name itself — see struct rule in door.c,
-     * where check_net_sendmsg below is the program that made that necessary.
+     * where wax_check_sendmsg below is the program that made that necessary.
      * EMPLOYEE_ID_ANY constrains nobody. */
     __u32 employee_id;
     __u8 addr[16];
@@ -138,7 +138,7 @@ struct net_event {
  * because one unconnected socket can sendto() many peers.
  *
  * Keying on the bare struct sock pointer is only sound because
- * check_net_sk_free() removes the entry when the socket is destroyed: the
+ * wax_check_sk_free() removes the entry when the socket is destroyed: the
  * kernel reuses those allocations freely, so without that hook a new socket
  * could land on a freed one's address and inherit its verdict — including one
  * decided for a different process under an exec-scoped rule. The uid is

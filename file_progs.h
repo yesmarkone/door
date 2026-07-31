@@ -37,7 +37,7 @@ static __always_inline void stage_exec_image(struct file *file)
 }
 
 SEC("lsm/bprm_check_security")
-long BPF_PROG(check_exec, struct linux_binprm *bprm, int ret)
+long BPF_PROG(wax_check_exec, struct linux_binprm *bprm, int ret)
 {
     if (ret) return lsm_ret(ret);
     if (!bprm->file) return 0;
@@ -46,7 +46,7 @@ long BPF_PROG(check_exec, struct linux_binprm *bprm, int ret)
 }
 
 SEC("lsm/file_open")
-long BPF_PROG(check_file_open, struct file *file, int ret)
+long BPF_PROG(wax_check_open, struct file *file, int ret)
 {
     __u32 mode;
 
@@ -61,7 +61,7 @@ long BPF_PROG(check_file_open, struct file *file, int ret)
 }
 
 SEC("lsm/path_unlink")
-long BPF_PROG(check_path_unlink, const struct path *dir, struct dentry *dentry)
+long BPF_PROG(wax_check_unlink, const struct path *dir, struct dentry *dentry)
 {
     /* delete(8), not write(4). A rule carrying only the write bit does not
      * stop this. */
@@ -69,7 +69,7 @@ long BPF_PROG(check_path_unlink, const struct path *dir, struct dentry *dentry)
 }
 
 SEC("lsm/path_rmdir")
-long BPF_PROG(check_path_rmdir, const struct path *dir, struct dentry *dentry)
+long BPF_PROG(wax_check_rmdir, const struct path *dir, struct dentry *dentry)
 {
     /* Shares OP_UNLINK with file deletion above, so one delete rule covers both
      * and neither can be written without the other. Reported as operation 4
@@ -78,21 +78,21 @@ long BPF_PROG(check_path_rmdir, const struct path *dir, struct dentry *dentry)
 }
 
 SEC("lsm/path_mkdir")
-long BPF_PROG(check_path_mkdir, const struct path *dir, struct dentry *dentry,
+long BPF_PROG(wax_check_mkdir, const struct path *dir, struct dentry *dentry,
              umode_t mode)
 {
     return lsm_ret(check_dir_dentry(dir, dentry, OP_MKDIR));
 }
 
 SEC("lsm/path_symlink")
-long BPF_PROG(check_path_symlink, const struct path *dir, struct dentry *dentry,
+long BPF_PROG(wax_check_symlink, const struct path *dir, struct dentry *dentry,
              const char *old_name)
 {
     return lsm_ret(check_dir_dentry(dir, dentry, OP_SYMLINK));
 }
 
 SEC("lsm/path_link")
-long BPF_PROG(check_path_link, struct dentry *old_dentry, const struct path *new_dir,
+long BPF_PROG(wax_check_link, struct dentry *old_dentry, const struct path *new_dir,
              struct dentry *new_dentry)
 {
     /* Like rename, both sides are checked: hard-linking a protected file to a
@@ -105,7 +105,7 @@ long BPF_PROG(check_path_link, struct dentry *old_dentry, const struct path *new
 }
 
 SEC("lsm/inode_mknod")
-long BPF_PROG(check_inode_mknod, struct inode *dir, struct dentry *dentry,
+long BPF_PROG(wax_check_mknod, struct inode *dir, struct dentry *dentry,
              umode_t mode, dev_t dev)
 {
     /* security_path_mknod is not in this kernel's bpf_d_path allowlist, so the
@@ -117,7 +117,7 @@ long BPF_PROG(check_inode_mknod, struct inode *dir, struct dentry *dentry,
 }
 
 SEC("lsm/path_rename")
-long BPF_PROG(check_path_rename, const struct path *old_dir, struct dentry *old_dentry,
+long BPF_PROG(wax_check_rename, const struct path *old_dir, struct dentry *old_dentry,
              const struct path *new_dir, struct dentry *new_dentry)
 {
     /* Both sides are checked, with different masks. The source loses a name, so
@@ -131,19 +131,19 @@ long BPF_PROG(check_path_rename, const struct path *old_dir, struct dentry *old_
 }
 
 SEC("lsm/path_chmod")
-long BPF_PROG(check_path_chmod, const struct path *path, umode_t mode)
+long BPF_PROG(wax_check_chmod, const struct path *path, umode_t mode)
 {
     return lsm_ret(check_path_op(path, OP_CHMOD));
 }
 
 SEC("lsm/path_chown")
-long BPF_PROG(check_path_chown, const struct path *path)
+long BPF_PROG(wax_check_chown, const struct path *path)
 {
     return lsm_ret(check_path_op(path, OP_CHOWN));
 }
 
 SEC("lsm/path_truncate")
-long BPF_PROG(check_path_truncate, const struct path *path)
+long BPF_PROG(wax_check_truncate, const struct path *path)
 {
     /* Path-based truncate()/truncate64() never opens the file, so
      * file_open(FMODE_WRITE) does not see it. Governing it here closes a
@@ -158,7 +158,7 @@ long BPF_PROG(check_path_truncate, const struct path *path)
 }
 
 SEC("lsm/inode_setattr")
-long BPF_PROG(check_inode_setattr, struct dentry *dentry, struct iattr *attr)
+long BPF_PROG(wax_check_setattr, struct dentry *dentry, struct iattr *attr)
 {
     __u32 ia_valid = BPF_CORE_READ(attr, ia_valid);
 
@@ -172,7 +172,7 @@ long BPF_PROG(check_inode_setattr, struct dentry *dentry, struct iattr *attr)
 }
 
 SEC("tracepoint/sched/sched_process_exec")
-int emit_committed_exec(void *ctx)
+int wax_emit_exec(void *ctx)
 {
     __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
     struct pending_exec_event *pending;
@@ -204,7 +204,7 @@ int emit_committed_exec(void *ctx)
  * would have no entry at all and would match no target_path rule, which for a
  * deny rule means the protection silently does not apply to it. */
 SEC("tp_btf/sched_process_fork")
-int BPF_PROG(track_fork, struct task_struct *parent, struct task_struct *child)
+int BPF_PROG(wax_track_fork, struct task_struct *parent, struct task_struct *child)
 {
     __u32 ppid = BPF_CORE_READ(parent, tgid), cpid = BPF_CORE_READ(child, tgid);
     __u32 zero = 0;
@@ -230,7 +230,7 @@ int BPF_PROG(track_fork, struct task_struct *parent, struct task_struct *child)
  * and start_clock would catch a reused pid regardless, but neither is a reason
  * to leave the table full of the dead. */
 SEC("tp_btf/sched_process_exit")
-int BPF_PROG(track_exit, struct task_struct *task)
+int BPF_PROG(wax_track_exit, struct task_struct *task)
 {
     __u32 pid = BPF_CORE_READ(task, pid), tgid = BPF_CORE_READ(task, tgid);
 

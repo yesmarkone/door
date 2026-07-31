@@ -20,7 +20,7 @@
  * task_is_exempt() is deliberately absent. Ingress is a host-wide policy with
  * no user behind it, so there is no session to exempt. */
 SEC("lsm/inet_conn_request")
-long BPF_PROG(check_net_ingress, struct sock *sk, struct sk_buff *skb,
+long BPF_PROG(wax_check_ingress, struct sock *sk, struct sk_buff *skb,
               struct request_sock *req, int ret)
 {
     /* Not named ctx: BPF_PROG's expansion already binds that identifier. */
@@ -55,7 +55,7 @@ long BPF_PROG(check_net_ingress, struct sock *sk, struct sk_buff *skb,
  * what makes a {"protocol": "tcp", "permission": create} rule behave the way it
  * reads. SOCK_RAW is left alone: 0 there means IPPROTO_IP, not a default. */
 SEC("lsm/socket_create")
-long BPF_PROG(check_net_create, int family, int type, int protocol, int kern, int ret)
+long BPF_PROG(wax_check_create, int family, int type, int protocol, int kern, int ret)
 {
     struct net_target t = {};
 
@@ -76,7 +76,7 @@ long BPF_PROG(check_net_create, int family, int type, int protocol, int kern, in
 }
 
 SEC("lsm/socket_bind")
-long BPF_PROG(check_net_bind, struct socket *sock, struct sockaddr *address,
+long BPF_PROG(wax_check_bind, struct socket *sock, struct sockaddr *address,
               int addrlen, int ret)
 {
     __u32 zero = 0;
@@ -94,7 +94,7 @@ long BPF_PROG(check_net_bind, struct socket *sock, struct sockaddr *address,
 }
 
 SEC("lsm/socket_listen")
-long BPF_PROG(check_net_listen, struct socket *sock, int backlog, int ret)
+long BPF_PROG(wax_check_listen, struct socket *sock, int backlog, int ret)
 {
     __u32 zero = 0;
     struct net_target t = {};
@@ -114,7 +114,7 @@ long BPF_PROG(check_net_listen, struct socket *sock, int backlog, int ret)
  * therefore judged on the listening socket's own address — which port was
  * opened — and per-peer inbound filtering is out of scope. */
 SEC("lsm/socket_accept")
-long BPF_PROG(check_net_accept, struct socket *sock, struct socket *newsock, int ret)
+long BPF_PROG(wax_check_accept, struct socket *sock, struct socket *newsock, int ret)
 {
     __u32 zero = 0;
     struct net_target t = {};
@@ -134,7 +134,7 @@ long BPF_PROG(check_net_accept, struct socket *sock, struct socket *newsock, int
  * sockaddr_un's sun_path is readable straight from the argument. That is why
  * there is no unix_stream_connect hook here. */
 SEC("lsm/socket_connect")
-long BPF_PROG(check_net_connect, struct socket *sock, struct sockaddr *address,
+long BPF_PROG(wax_check_connect, struct socket *sock, struct sockaddr *address,
               int addrlen, int ret)
 {
     __u32 zero = 0;
@@ -169,7 +169,7 @@ long BPF_PROG(check_net_connect, struct socket *sock, struct sockaddr *address,
  * silently deciding an access.
  */
 SEC("lsm/socket_sendmsg")
-long BPF_PROG(check_net_sendmsg, struct socket *sock, struct msghdr *msg,
+long BPF_PROG(wax_check_sendmsg, struct socket *sock, struct msghdr *msg,
               int size, int ret)
 {
     __u32 zero = 0, gen = 0;
@@ -229,7 +229,7 @@ long BPF_PROG(check_net_sendmsg, struct socket *sock, struct msghdr *msg,
  * new socket. Without this the cache key — a bare struct sock pointer — would
  * alias across sockets and leak one process's verdict to another. */
 SEC("lsm/sk_free_security")
-void BPF_PROG(check_net_sk_free, struct sock *sk)
+void BPF_PROG(wax_check_sk_free, struct sock *sk)
 {
     struct net_cache_key key = { .sk = (__u64)(unsigned long)sk };
 

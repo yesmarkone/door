@@ -245,7 +245,7 @@ static __always_inline int check_cred_policy(const struct cred *new_cred,
  * therefore audited but not felt by the caller.
  */
 SEC("lsm/task_fix_setuid")
-long BPF_PROG(check_task_fix_setuid, struct cred *new, const struct cred *old, int flags)
+long BPF_PROG(wax_check_setuid, struct cred *new, const struct cred *old, int flags)
 {
     return lsm_ret(check_cred_policy(new, old, OP_SETUID, CRED_OP_SETUID_BIT, flags));
 }
@@ -260,7 +260,7 @@ long BPF_PROG(check_task_fix_setuid, struct cred *new, const struct cred *old, i
  * visible here. The README says so plainly.
  */
 SEC("lsm/task_fix_setgid")
-long BPF_PROG(check_task_fix_setgid, struct cred *new, const struct cred *old, int flags)
+long BPF_PROG(wax_check_setgid, struct cred *new, const struct cred *old, int flags)
 {
     return lsm_ret(check_cred_policy(new, old, OP_SETGID, CRED_OP_SETGID_BIT, flags));
 }

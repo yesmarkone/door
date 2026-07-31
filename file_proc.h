@@ -174,7 +174,7 @@ static __always_inline int check_proc_policy(struct task_struct *p, __u8 op,
 }
 
 SEC("lsm/task_kill")
-long BPF_PROG(check_task_kill, struct task_struct *p, struct kernel_siginfo *info,
+long BPF_PROG(wax_check_kill, struct task_struct *p, struct kernel_siginfo *info,
              int sig, const struct cred *cred)
 {
     return lsm_ret(check_proc_policy(p, OP_KILL, PROC_OP_KILL_BIT, (__u32)sig, 0));
@@ -200,7 +200,7 @@ long BPF_PROG(check_task_kill, struct task_struct *p, struct kernel_siginfo *inf
  * to reach a task these rules protect.
  */
 SEC("lsm/ptrace_access_check")
-long BPF_PROG(check_ptrace_access, struct task_struct *child, unsigned int mode)
+long BPF_PROG(wax_check_ptrace, struct task_struct *child, unsigned int mode)
 {
     /* mode also carries FSCREDS/REALCREDS/NOAUDIT; only the two access bits
      * are matched, and a mode outside them matches only unconstrained rules. */
