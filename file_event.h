@@ -34,7 +34,7 @@ static __always_inline void emit_event(__u32 uid, __u8 op, __u8 status,
                                        __u8 signal, const struct cred_event_ids *ids,
                                        __u32 rule_slot)
 {
-    struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    struct event *e = bpf_ringbuf_reserve(&wax_events, sizeof(*e), 0);
     struct task_struct *task;
     struct tty_struct *tty = 0;
     struct mm_struct *mm = 0;
@@ -102,7 +102,7 @@ static __always_inline void queue_exec_event(__u32 uid, __u8 status, const char 
     struct mm_struct *parent_mm;
     struct file *exe_file;
 
-    pending = bpf_map_lookup_elem(&pending_exec_scratch, &zero);
+    pending = bpf_map_lookup_elem(&wax_exec_scratch, &zero);
     if (!pending) return;
     pending->uid = uid;
     pending->status = status;
@@ -113,7 +113,7 @@ static __always_inline void queue_exec_event(__u32 uid, __u8 status, const char 
     if (policy_id)
         bpf_probe_read_kernel_str(pending->policy_id, sizeof(pending->policy_id),
                                   policy_id);
-    scratch = bpf_map_lookup_elem(&executable_path_scratch, &zero);
+    scratch = bpf_map_lookup_elem(&wax_executable_path_scratch, &zero);
     if (scratch) {
         scratch->path[0] = '\0';
         task = (struct task_struct *)bpf_get_current_task_btf();
@@ -131,7 +131,7 @@ static __always_inline void queue_exec_event(__u32 uid, __u8 status, const char 
         bpf_probe_read_kernel_str(pending->executable_path,
                                   sizeof(pending->executable_path), scratch->path);
     }
-    bpf_map_update_elem(&pending_execs, &pid, pending, BPF_ANY);
+    bpf_map_update_elem(&wax_pending_execs, &pid, pending, BPF_ANY);
 }
 
 #endif /* DOOR_FILE_EVENT_H */

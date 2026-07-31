@@ -4,7 +4,7 @@
 #ifndef DOOR_FILE_PROGS_H
 #define DOOR_FILE_PROGS_H
 
-/* Resolve the image about to be executed and stage it for pid_image.
+/* Resolve the image about to be executed and stage it for wax_pid_image.
  *
  * Called for EVERY exec, before task_is_exempt() has a say. That is deliberate
  * and is the whole point: tasks with no audit session are the systemd-started
@@ -18,7 +18,7 @@ static __always_inline void stage_exec_image(struct file *file)
     struct pid_image *img;
     long len;
 
-    ps = bpf_map_lookup_elem(&file_path_scratch, &zero);
+    ps = bpf_map_lookup_elem(&wax_file_path_scratch, &zero);
     if (!ps) return;
     ps->path[0] = '\0';
     /* A second bpf_d_path on the exec path, since check() below resolves its
@@ -27,13 +27,13 @@ static __always_inline void stage_exec_image(struct file *file)
      * contortion it would take. */
     len = bpf_d_path(&file->f_path, ps->path, PATH_LEN);
     if (len <= 0) return;
-    img = bpf_map_lookup_elem(&pending_image_scratch, &zero);
+    img = bpf_map_lookup_elem(&wax_img_scratch, &zero);
     if (!img) return;
     img->start_clock = 0;   /* filled at the tracepoint, once the exec is real */
     img->path_len = (__u32)len - 1;
     img->_pad = 0;
     bpf_probe_read_kernel_str(img->exe_path, sizeof(img->exe_path), ps->path);
-    bpf_map_update_elem(&pending_image, &pid, img, BPF_ANY);
+    bpf_map_update_elem(&wax_pending_image, &pid, img, BPF_ANY);
 }
 
 SEC("lsm/bprm_check_security")
@@ -181,21 +181,21 @@ int wax_emit_exec(void *ctx)
     /* The exec is now real, so the image staged in bprm_check becomes this
      * process's current one. Done before the event below because it must
      * happen for every exec, and the event only fires for some. */
-    staged = bpf_map_lookup_elem(&pending_image, &pid);
+    staged = bpf_map_lookup_elem(&wax_pending_image, &pid);
     if (staged) {
         struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 
         staged->start_clock = BPF_CORE_READ(task, start_boottime) / NSEC_PER_CLOCK;
-        bpf_map_update_elem(&pid_image, &pid, staged, BPF_ANY);
-        bpf_map_delete_elem(&pending_image, &pid);
+        bpf_map_update_elem(&wax_pid_image, &pid, staged, BPF_ANY);
+        bpf_map_delete_elem(&wax_pending_image, &pid);
     }
 
-    pending = bpf_map_lookup_elem(&pending_execs, &pid);
+    pending = bpf_map_lookup_elem(&wax_pending_execs, &pid);
     if (!pending) return 0;
     emit_event(pending->uid, OP_EXEC, pending->status, pending->file,
                pending->executable_path, pending->policy_id, 1, 0, 0,
                pending->rule_slot);
-    bpf_map_delete_elem(&pending_execs, &pid);
+    bpf_map_delete_elem(&wax_pending_execs, &pid);
     return 0;
 }
 
@@ -211,18 +211,18 @@ int BPF_PROG(wax_track_fork, struct task_struct *parent, struct task_struct *chi
     struct pid_image *pimg, *copy;
 
     if (ppid == cpid) return 0;         /* a new thread, not a new process */
-    pimg = bpf_map_lookup_elem(&pid_image, &ppid);
+    pimg = bpf_map_lookup_elem(&wax_pid_image, &ppid);
     if (!pimg) return 0;
     /* Copied through scratch rather than edited in place: pimg points into the
      * parent's map value, and stamping the child's start time onto it would
      * corrupt the parent's entry and make it fail its own staleness check. */
-    copy = bpf_map_lookup_elem(&pending_image_scratch, &zero);
+    copy = bpf_map_lookup_elem(&wax_img_scratch, &zero);
     if (!copy) return 0;
     __builtin_memcpy(copy, pimg, sizeof(*copy));
     /* The child gets its own start time: the entry must stay verifiable
      * against the task it now describes, not the one it was copied from. */
     copy->start_clock = BPF_CORE_READ(child, start_boottime) / NSEC_PER_CLOCK;
-    bpf_map_update_elem(&pid_image, &cpid, copy, BPF_ANY);
+    bpf_map_update_elem(&wax_pid_image, &cpid, copy, BPF_ANY);
     return 0;
 }
 
@@ -235,8 +235,8 @@ int BPF_PROG(wax_track_exit, struct task_struct *task)
     __u32 pid = BPF_CORE_READ(task, pid), tgid = BPF_CORE_READ(task, tgid);
 
     if (pid != tgid) return 0;          /* a thread exiting, not the process */
-    bpf_map_delete_elem(&pid_image, &tgid);
-    bpf_map_delete_elem(&pending_image, &tgid);
+    bpf_map_delete_elem(&wax_pid_image, &tgid);
+    bpf_map_delete_elem(&wax_pending_image, &tgid);
     return 0;
 }
 #endif /* DOOR_FILE_PROGS_H */

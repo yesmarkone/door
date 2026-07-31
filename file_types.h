@@ -28,7 +28,7 @@
  * RHEL 9 (5.14), it put wax_check_sendmsg in net.c past the one-million
  * instruction ceiling and the object stopped loading. A scalar compare costs
  * nothing. The loader interns each distinct name to an id and publishes the
- * mapping in employee_ids, which check_policy consults once per check —
+ * mapping in wax_employee_ids, which check_policy consults once per check —
  * outside the loop, where one pointer branch is affordable. */
 struct rule {
     char exec_path[PATH_LEN];
@@ -65,9 +65,9 @@ _Static_assert(__builtin_offsetof(struct rule, warn) == 586,
  * exec_path is the SENDER's image and target_path the TARGET's, both matched
  * with the same glob syntax and matcher the file rules use. Neither can come
  * from bpf_d_path here — the helper is rejected at this attach point on RHEL 9
- * (measured: "helper call is not allowed") — so both are read out of pid_image,
+ * (measured: "helper call is not allowed") — so both are read out of wax_pid_image,
  * which the exec hook fills while d_path is still available. That indirection
- * is the whole reason pid_image exists.
+ * is the whole reason wax_pid_image exists.
  *
  * signals is a bitmask of 1 << signo; 0 means the rule does not constrain the
  * signal. Signal 0 is the existence-check idiom (kill(pid, 0)) and is included
@@ -105,7 +105,7 @@ _Static_assert(__builtin_offsetof(struct proc_rule, warn) == 604,
  * which is what su and sudo do once they are running.
  *
  * There is deliberately no "from" field. The source identity is the audit login
- * uid, and that is already the key active_cred_policy_by_uid was looked up by —
+ * uid, and that is already the key wax_active_cred_policy_by_uid was looked up by —
  * a from_uid would either restate it or be dead. Read a rule as "the login uid
  * this policy belongs to may not acquire to_uid".
  *
@@ -125,7 +125,7 @@ _Static_assert(__builtin_offsetof(struct proc_rule, warn) == 604,
  *
  * exec_path cannot come from bpf_d_path — the helper is rejected at the
  * credential hooks exactly as it is at task_kill — so it is read out of
- * pid_image, filled on exec where the helper is allowed. */
+ * wax_pid_image, filled on exec where the helper is allowed. */
 struct cred_rule {
     char exec_path[PATH_LEN];       /*   0 — the switching process's image */
     __u8 exec_wild[PATH_LEN / 8];   /* 256 */
@@ -210,7 +210,7 @@ struct cred_policy_slot {
  * reports, so wdog can prime this map for processes that were already running
  * when it started and the two sides compare exactly. It guards against a stale
  * entry being read for a reused pid — the same job login_uid does in
- * session_identity. */
+ * wax_session_identity. */
 struct pid_image {
     char exe_path[PATH_LEN];
     __u64 start_clock;
@@ -338,7 +338,7 @@ struct file_path_scratch {
 };
 
 /* Right-to-left dentry-walk buffer for hooks that only receive a dentry
- * (inode_setattr). Same 2x headroom rationale as file_path_scratch. */
+ * (inode_setattr). Same 2x headroom rationale as wax_file_path_scratch. */
 struct dentry_walk_scratch {
     char build[PATH_LEN * 2];
     char name[PATH_LEN];

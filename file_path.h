@@ -14,18 +14,18 @@ static __always_inline int check(struct file *file, __u8 op)
         /* Do not retain an older pending exec event for an exempt task. */
         if (op == OP_EXEC) {
             __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
-            bpf_map_delete_elem(&pending_execs, &pid);
+            bpf_map_delete_elem(&wax_pending_execs, &pid);
         }
         return 0;
     }
-    path_scratch = bpf_map_lookup_elem(&file_path_scratch, &zero);
+    path_scratch = bpf_map_lookup_elem(&wax_file_path_scratch, &zero);
     if (!path_scratch) return 0;
     path_scratch->path[0] = '\0';
     len = bpf_d_path(&file->f_path, path_scratch->path, PATH_LEN);
     if (len <= 0) return 0;
     if (op == OP_EXEC) {
         __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
-        bpf_map_delete_elem(&pending_execs, &pid);
+        bpf_map_delete_elem(&wax_pending_execs, &pid);
     }
     return check_policy(path_scratch->path, (__u32)len - 1, op);
 }
@@ -43,7 +43,7 @@ static __always_inline int check_dir_dentry(const struct path *dir,
     long len;
 
     if (task_is_exempt()) return 0;
-    ps = bpf_map_lookup_elem(&file_path_scratch, &zero);
+    ps = bpf_map_lookup_elem(&wax_file_path_scratch, &zero);
     if (!ps) return 0;
     ps->path[0] = '\0';
     len = bpf_d_path((struct path *)dir, ps->path, PATH_LEN);
@@ -79,7 +79,7 @@ static __always_inline int check_path_op(const struct path *p, __u8 op)
     long len;
 
     if (task_is_exempt()) return 0;
-    ps = bpf_map_lookup_elem(&file_path_scratch, &zero);
+    ps = bpf_map_lookup_elem(&wax_file_path_scratch, &zero);
     if (!ps) return 0;
     ps->path[0] = '\0';
     len = bpf_d_path((struct path *)p, ps->path, PATH_LEN);
@@ -153,8 +153,8 @@ static __always_inline int check_dentry_op(struct dentry *dentry, __u8 op)
     long len;
 
     if (task_is_exempt()) return 0;
-    s = bpf_map_lookup_elem(&dentry_walk_scratch_map, &zero);
-    ps = bpf_map_lookup_elem(&file_path_scratch, &zero);
+    s = bpf_map_lookup_elem(&wax_dentry_walk_scratch_map, &zero);
+    ps = bpf_map_lookup_elem(&wax_file_path_scratch, &zero);
     if (!s || !ps) return 0;
     s->build[PATH_LEN] = '\0';
     ctx = (struct dentry_walk_ctx){ .d = dentry, .s = s, .pos = PATH_LEN };

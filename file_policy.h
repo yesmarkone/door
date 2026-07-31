@@ -78,7 +78,7 @@ static long check_rule_cb(__u32 i, void *data)
         return 0;
 
     ctx->matched = 1;
-    cfg = bpf_map_lookup_elem(&runtime_config_map, &zero);
+    cfg = bpf_map_lookup_elem(&wax_runtime_config_map, &zero);
     /* Warn because this rule is observe-only, or this policy is, or the whole
      * host is — three scopes of one switch, OR'd. See struct policy_meta.
      *
@@ -139,7 +139,7 @@ static __always_inline int check_policy(const char *path, __u32 path_len, __u8 o
 
     task = (struct task_struct *)bpf_get_current_task_btf();
     uid = BPF_CORE_READ(task, loginuid.val);
-    inner = bpf_map_lookup_elem(&active_policy_by_uid, &uid);
+    inner = bpf_map_lookup_elem(&wax_active_policy_by_uid, &uid);
     if (!inner) {
         if (op == OP_EXEC) queue_exec_event(uid, 'S', path, 0, RULE_SLOT_NONE);
         return 0;
@@ -159,7 +159,7 @@ static __always_inline int check_policy(const char *path, __u32 path_len, __u8 o
     /* Resolve the current process image for exec_path matching. For OP_EXEC
      * this is still the invoking image (e.g. the shell): bprm_check runs
      * before the new image is committed. */
-    executable_scratch = bpf_map_lookup_elem(&executable_path_scratch, &zero);
+    executable_scratch = bpf_map_lookup_elem(&wax_executable_path_scratch, &zero);
     if (executable_scratch) {
         executable_scratch->path[0] = '\0';
         executable_path = executable_scratch->path;

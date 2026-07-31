@@ -43,7 +43,7 @@ static long check_ingress_rule_cb(__u32 i, void *data)
 
     if (i >= ctx->count) return 1;
     index = 1 + i;
-    slot = bpf_map_lookup_elem(&ingress_policy, &index);
+    slot = bpf_map_lookup_elem(&wax_ingress_policy, &index);
     if (!slot || !slot->rule.enabled) return 0;
     r = &slot->rule;
     if (r->family && r->family != ctx->family) return 0;
@@ -57,7 +57,7 @@ static long check_ingress_rule_cb(__u32 i, void *data)
     if (!match_addr_prefix(r->local_addr, r->local_prefix_len, ctx->local)) return 0;
 
     ctx->matched = 1;
-    cfg = bpf_map_lookup_elem(&net_runtime_config_map, &zero);
+    cfg = bpf_map_lookup_elem(&wax_net_runtime_config_map, &zero);
     /* Warn because this rule is observe-only, or this policy is, or the whole
      * host is. cfg == NULL still enforces; see door.c's check_rule_cb. */
     warn = r->warn || ctx->warning || (cfg && cfg->mode == MODE_WARN);
@@ -80,7 +80,7 @@ static long check_ingress_rule_cb(__u32 i, void *data)
 static __always_inline void emit_ingress_event(const struct ingress_ctx *ctx, __u8 status,
                                                const char *policy_id)
 {
-    struct net_event *e = bpf_ringbuf_reserve(&net_events, sizeof(*e), 0);
+    struct net_event *e = bpf_ringbuf_reserve(&wax_net_events, sizeof(*e), 0);
 
     if (!e) return;
     zero_net_event(e);
@@ -110,7 +110,7 @@ static __always_inline int check_ingress(struct ingress_ctx *ctx)
     struct ingress_seen_key seen = {};
     __u32 *prev;
 
-    meta = bpf_map_lookup_elem(&ingress_policy, &zero);
+    meta = bpf_map_lookup_elem(&wax_ingress_policy, &zero);
     if (!meta) return 0;
     ctx->count = meta->meta.rule_count;
     if (ctx->count > MAX_RULES) ctx->count = MAX_RULES;
@@ -120,14 +120,14 @@ static __always_inline int check_ingress(struct ingress_ctx *ctx)
     bpf_loop(MAX_RULES, check_ingress_rule_cb, ctx, 0);
     if (!ctx->matched || !ctx->emit) return ctx->result;
 
-    cfg = bpf_map_lookup_elem(&net_runtime_config_map, &zero);
+    cfg = bpf_map_lookup_elem(&wax_net_runtime_config_map, &zero);
     gen = cfg ? cfg->generation : 0;
     __builtin_memcpy(seen.src, ctx->src, 16);
     seen.sport = ctx->sport;
     seen.lport = ctx->lport;
-    prev = bpf_map_lookup_elem(&ingress_seen, &seen);
+    prev = bpf_map_lookup_elem(&wax_ingress_seen, &seen);
     if (prev && *prev == gen) return ctx->result;  /* a SYN retransmit */
-    bpf_map_update_elem(&ingress_seen, &seen, &gen, BPF_ANY);
+    bpf_map_update_elem(&wax_ingress_seen, &seen, &gen, BPF_ANY);
     emit_ingress_event(ctx, ctx->status, meta->meta.id);
     return ctx->result;
 }

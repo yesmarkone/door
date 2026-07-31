@@ -140,7 +140,7 @@ static __always_inline __u32 current_employee_id(struct task_struct *task,
     __u32 *id;
 
     if (sid == (__u32)-1) return EMPLOYEE_ID_ANY;
-    si = bpf_map_lookup_elem(&session_identity, &sid);
+    si = bpf_map_lookup_elem(&wax_session_identity, &sid);
     if (!si) return EMPLOYEE_ID_ANY;
     /* Audit session ids are reused after a reboot, and a session killed hard
      * never runs close_session. A record whose login uid no longer matches is
@@ -148,7 +148,7 @@ static __always_inline __u32 current_employee_id(struct task_struct *task,
     if (si->login_uid != login_uid) return EMPLOYEE_ID_ANY;
     /* The name is looked up in place: employee_name_key is exactly the leading
      * field of the record, so no copy to a key buffer is needed. */
-    id = bpf_map_lookup_elem(&employee_ids, si->employee_name);
+    id = bpf_map_lookup_elem(&wax_employee_ids, si->employee_name);
     if (!id) return EMPLOYEE_ID_ANY;
     return *id;
 }

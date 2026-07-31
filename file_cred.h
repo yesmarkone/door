@@ -14,7 +14,7 @@
  * The identity it is switching FROM is the audit login uid, which already chose
  * the policy — see struct cred_rule for why the momentary real uid is not a
  * usable source axis. As with the process controls, bpf_d_path is rejected here
- * so the image comes from pid_image.
+ * so the image comes from wax_pid_image.
  * ------------------------------------------------------------------------- */
 
 /* The four id slots of a credential, in a fixed order shared by the new and old
@@ -142,7 +142,7 @@ static long check_cred_rule_cb(__u32 i, void *data)
     }
 
     ctx->matched = 1;
-    cfg = bpf_map_lookup_elem(&runtime_config_map, &zero);
+    cfg = bpf_map_lookup_elem(&wax_runtime_config_map, &zero);
     /* Per-rule, per-policy or host-wide; see check_rule_cb for why cfg == NULL
      * still enforces. */
     warn = r->warn || ctx->warning || (cfg && cfg->mode == MODE_WARN);
@@ -205,7 +205,7 @@ static __always_inline int check_cred_policy(const struct cred *new_cred,
 
     task = (struct task_struct *)bpf_get_current_task_btf();
     uid = BPF_CORE_READ(task, loginuid.val);
-    inner = bpf_map_lookup_elem(&active_cred_policy_by_uid, &uid);
+    inner = bpf_map_lookup_elem(&wax_active_cred_policy_by_uid, &uid);
     if (!inner) return 0;
     meta = bpf_map_lookup_elem(inner, &zero);
     if (!meta) return 0;

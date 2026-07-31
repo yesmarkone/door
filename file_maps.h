@@ -10,14 +10,14 @@ struct {
     __uint(max_entries, 1 + MAX_RULES);
     __type(key, __u32);
     __type(value, struct policy_slot);
-} policy_template SEC(".maps");
+} wax_policy_template SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
     __uint(max_entries, 4096);
     __type(key, __u32);
-    __array(values, typeof(policy_template));
-} active_policy_by_uid SEC(".maps");
+    __array(values, typeof(wax_policy_template));
+} wax_active_policy_by_uid SEC(".maps");
 
 /* Signal rules get their own array and their own map-in-map rather than
  * sharing the file rules': the slot layouts differ, and keeping the two apart
@@ -27,14 +27,14 @@ struct {
     __uint(max_entries, 1 + MAX_RULES);
     __type(key, __u32);
     __type(value, struct proc_policy_slot);
-} proc_policy_template SEC(".maps");
+} wax_proc_policy_template SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
     __uint(max_entries, 4096);
     __type(key, __u32);
-    __array(values, typeof(proc_policy_template));
-} active_proc_policy_by_uid SEC(".maps");
+    __array(values, typeof(wax_proc_policy_template));
+} wax_active_proc_policy_by_uid SEC(".maps");
 
 /* Credential rules get a third array for the same reason the signal rules got a
  * second one: the slot is a different size, and a setuid check has no business
@@ -44,14 +44,14 @@ struct {
     __uint(max_entries, 1 + MAX_RULES);
     __type(key, __u32);
     __type(value, struct cred_policy_slot);
-} cred_policy_template SEC(".maps");
+} wax_cred_policy_template SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
     __uint(max_entries, 4096);
     __type(key, __u32);
-    __array(values, typeof(cred_policy_template));
-} active_cred_policy_by_uid SEC(".maps");
+    __array(values, typeof(wax_cred_policy_template));
+} wax_active_cred_policy_by_uid SEC(".maps");
 
 /* tgid -> the image that process is running.
  *
@@ -61,7 +61,7 @@ struct {
  * already running — and those are precisely the processes a kill rule is
  * usually written to protect.
  *
- * LRU rather than a plain hash: unlike session_identity there is no external
+ * LRU rather than a plain hash: unlike wax_session_identity there is no external
  * writer to report an overflow, and losing an entry degrades to "image
  * unknown" rather than to a wrong answer. */
 struct {
@@ -69,9 +69,9 @@ struct {
     __uint(max_entries, 10240);
     __type(key, __u32); /* tgid */
     __type(value, struct pid_image);
-} pid_image SEC(".maps");
+} wax_pid_image SEC(".maps");
 
-/* Staging for pid_image, exactly mirroring pending_execs' reason for existing:
+/* Staging for wax_pid_image, exactly mirroring wax_pending_execs' reason for existing:
  * bprm_check_security runs BEFORE the exec is committed, and the exec can still
  * fail afterwards. Recording the image straight from there would let a process
  * claim an image it never actually ran. The sched_process_exec tracepoint
@@ -81,7 +81,7 @@ struct {
     __uint(max_entries, 4096);
     __type(key, __u32);
     __type(value, struct pid_image);
-} pending_image SEC(".maps");
+} wax_pending_image SEC(".maps");
 
 /* struct pid_image is 272 bytes — more than half the verifier's 512-byte call
  * stack, and the exec hook that fills one also calls check(). Assembled here
@@ -91,14 +91,14 @@ struct {
     __uint(max_entries, 1);
     __type(key, __u32);
     __type(value, struct pid_image);
-} pending_image_scratch SEC(".maps");
+} wax_img_scratch SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
     __type(value, struct runtime_config);
-} runtime_config_map SEC(".maps");
+} wax_runtime_config_map SEC(".maps");
 
 /* Audit session id -> the employee PAM logged in on it. Written from userspace
  * only (pam_wood.so on login/logout, wdog's reaper for sessions that died
@@ -119,7 +119,7 @@ struct {
     __type(key, __u32); /* audit session id */
     __type(value, struct session_identity);
     __uint(pinning, LIBBPF_PIN_BY_NAME);
-} session_identity SEC(".maps");
+} wax_session_identity SEC(".maps");
 
 /* Employee name -> the id rules carry, interned by the loader. Written only by
  * wdog, and only while installing policies; read here once per check.
@@ -128,7 +128,7 @@ struct {
  * wdog runs, so a policy replacement cannot silently repoint an id that rules
  * from the previous generation still reference.
  *
- * Pinned and shared exactly like session_identity, and for the same reason: the
+ * Pinned and shared exactly like wax_session_identity, and for the same reason: the
  * file and network objects have to agree on the id space. */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -136,33 +136,33 @@ struct {
     __type(key, struct employee_name_key);
     __type(value, __u32);
     __uint(pinning, LIBBPF_PIN_BY_NAME);
-} employee_ids SEC(".maps");
+} wax_employee_ids SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 1 << 24);
-} events SEC(".maps");
+} wax_events SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 4096);
     __type(key, __u32);
     __type(value, struct pending_exec_event);
-} pending_execs SEC(".maps");
+} wax_pending_execs SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
     __type(value, struct pending_exec_event);
-} pending_exec_scratch SEC(".maps");
+} wax_exec_scratch SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
     __type(value, struct executable_path_scratch);
-} executable_path_scratch SEC(".maps");
+} wax_executable_path_scratch SEC(".maps");
 
 /* bpf_d_path output is kept off the BPF call stack. check() invokes policy
  * callbacks and path matchers, so a 256-byte local buffer would exceed the
@@ -172,13 +172,13 @@ struct {
     __uint(max_entries, 1);
     __type(key, __u32);
     __type(value, struct file_path_scratch);
-} file_path_scratch SEC(".maps");
+} wax_file_path_scratch SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
     __type(value, struct dentry_walk_scratch);
-} dentry_walk_scratch_map SEC(".maps");
+} wax_dentry_walk_scratch_map SEC(".maps");
 
 #endif /* DOOR_FILE_MAPS_H */

@@ -22,7 +22,7 @@ static __always_inline void emit_net_event(__u32 uid, __u8 op, __u8 status,
                                            const char *executable_path,
                                            const char *policy_id, __u32 rule_slot)
 {
-    struct net_event *e = bpf_ringbuf_reserve(&net_events, sizeof(*e), 0);
+    struct net_event *e = bpf_ringbuf_reserve(&wax_net_events, sizeof(*e), 0);
     struct task_struct *task;
     struct tty_struct *tty = 0;
     struct mm_struct *mm = 0;

@@ -68,7 +68,7 @@
  * reject an update of the wrong size. */
 #define EMPLOYEE_NAME_LEN 64
 
-#define DEFAULT_MAP_PATH "/sys/fs/bpf/libwdoor/session_identity"
+#define DEFAULT_MAP_PATH "/sys/fs/bpf/libwdoor/wax_session_identity"
 #define DEFAULT_ENV_NAME "PAM_EMPLOYEE_NAME"
 
 /* Mirrors struct session_identity in door/file.c. login_uid is not a matching

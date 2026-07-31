@@ -85,7 +85,7 @@ long BPF_PROG(wax_check_bind, struct socket *sock, struct sockaddr *address,
 
     if (ret) return lsm_ret(ret);
     if (task_is_exempt()) return 0;
-    pb = bpf_map_lookup_elem(&net_addr_scratch, &zero);
+    pb = bpf_map_lookup_elem(&wax_net_addr_scratch, &zero);
     if (!pb) return 0;
     pb->path[0] = '\0';
     read_sock_meta(sock, &t);
@@ -102,7 +102,7 @@ long BPF_PROG(wax_check_listen, struct socket *sock, int backlog, int ret)
 
     if (ret) return lsm_ret(ret);
     if (task_is_exempt()) return 0;
-    pb = bpf_map_lookup_elem(&net_addr_scratch, &zero);
+    pb = bpf_map_lookup_elem(&wax_net_addr_scratch, &zero);
     if (!pb) return 0;
     pb->path[0] = '\0';
     if (read_sock_local(sock, &t, pb->path) < 0) return 0;
@@ -122,7 +122,7 @@ long BPF_PROG(wax_check_accept, struct socket *sock, struct socket *newsock, int
 
     if (ret) return lsm_ret(ret);
     if (task_is_exempt()) return 0;
-    pb = bpf_map_lookup_elem(&net_addr_scratch, &zero);
+    pb = bpf_map_lookup_elem(&wax_net_addr_scratch, &zero);
     if (!pb) return 0;
     pb->path[0] = '\0';
     if (read_sock_local(sock, &t, pb->path) < 0) return 0;
@@ -143,7 +143,7 @@ long BPF_PROG(wax_check_connect, struct socket *sock, struct sockaddr *address,
 
     if (ret) return lsm_ret(ret);
     if (task_is_exempt()) return 0;
-    pb = bpf_map_lookup_elem(&net_addr_scratch, &zero);
+    pb = bpf_map_lookup_elem(&wax_net_addr_scratch, &zero);
     if (!pb) return 0;
     pb->path[0] = '\0';
     read_sock_meta(sock, &t);
@@ -158,7 +158,7 @@ long BPF_PROG(wax_check_connect, struct socket *sock, struct sockaddr *address,
  *  1. msg_name == NULL means the destination was fixed by connect() and already
  *     judged there. Every TCP send and every connected-UDP send exits here, at
  *     the cost of one field read.
- *  2. An IP destination is looked up in net_verdict_cache, keyed by socket and
+ *  2. An IP destination is looked up in wax_net_verdict_cache, keyed by socket and
  *     destination; a hit for the current policy generation skips the rule scan
  *     entirely. This is what makes a sendto() loop to one collector cheap.
  *  3. Only a cache miss runs the full policy scan, and it caches the result.
@@ -187,14 +187,14 @@ long BPF_PROG(wax_check_sendmsg, struct socket *sock, struct msghdr *msg,
     if (!name) return 0;
     addrlen = BPF_CORE_READ(msg, msg_namelen);
 
-    pb = bpf_map_lookup_elem(&net_addr_scratch, &zero);
+    pb = bpf_map_lookup_elem(&wax_net_addr_scratch, &zero);
     if (!pb) return 0;
     pb->path[0] = '\0';
     read_sock_meta(sock, &t);
     if (read_sockaddr(name, addrlen, &t, pb->path) < 0) return 0;
     t.is_remote = 1;
 
-    cfg = bpf_map_lookup_elem(&net_runtime_config_map, &zero);
+    cfg = bpf_map_lookup_elem(&wax_net_runtime_config_map, &zero);
     gen = cfg ? cfg->generation : 0;
 
     if (t.has_addr && t.sk) {
@@ -205,7 +205,7 @@ long BPF_PROG(wax_check_sendmsg, struct socket *sock, struct msghdr *msg,
         __u32 sid = BPF_CORE_READ(task, sessionid);
 
         key.sk = t.sk;
-        val = bpf_map_lookup_elem(&net_verdict_cache, &key);
+        val = bpf_map_lookup_elem(&wax_net_verdict_cache, &key);
         if (val && val->generation == gen && val->uid == uid &&
             val->session_id == sid &&
             val->port == t.port && addrs_equal(val->addr, t.addr))
@@ -219,7 +219,7 @@ long BPF_PROG(wax_check_sendmsg, struct socket *sock, struct msghdr *msg,
         nv.port = t.port;
         nv.verdict = r ? 1 : 0;
         nv.emitted = 1;
-        bpf_map_update_elem(&net_verdict_cache, &key, &nv, BPF_ANY);
+        bpf_map_update_elem(&wax_net_verdict_cache, &key, &nv, BPF_ANY);
         return lsm_ret(r);
     }
     return lsm_ret(check_net_policy(&t, OP_NET_SEND, NPERM_CONNECT));
@@ -233,6 +233,6 @@ void BPF_PROG(wax_check_sk_free, struct sock *sk)
 {
     struct net_cache_key key = { .sk = (__u64)(unsigned long)sk };
 
-    bpf_map_delete_elem(&net_verdict_cache, &key);
+    bpf_map_delete_elem(&wax_net_verdict_cache, &key);
 }
 #endif /* DOOR_NET_PROGS_H */

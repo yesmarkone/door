@@ -102,7 +102,7 @@ static long check_net_rule_cb(__u32 i, void *data)
     }
 
     ctx->matched = 1;
-    cfg = bpf_map_lookup_elem(&net_runtime_config_map, &zero);
+    cfg = bpf_map_lookup_elem(&wax_net_runtime_config_map, &zero);
     /* Warn because this rule is observe-only, or this policy is, or the whole
      * host is. cfg == NULL still enforces, so a failed runtime_config lookup
      * remains fail-closed for every rule that leaves both flags clear; see
@@ -150,7 +150,7 @@ static __always_inline int check_net_policy(const struct net_target *t, __u8 op,
 
     task = (struct task_struct *)bpf_get_current_task_btf();
     uid = BPF_CORE_READ(task, loginuid.val);
-    inner = bpf_map_lookup_elem(&active_net_policy_by_uid, &uid);
+    inner = bpf_map_lookup_elem(&wax_active_net_policy_by_uid, &uid);
     if (!inner) return 0;
     meta = bpf_map_lookup_elem(inner, &zero);
     if (!meta) return 0;
@@ -158,7 +158,7 @@ static __always_inline int check_net_policy(const struct net_target *t, __u8 op,
     if (count > MAX_RULES) count = MAX_RULES;
     if (count == 0) return 0;
 
-    exec_scratch = bpf_map_lookup_elem(&net_exec_path_scratch, &zero);
+    exec_scratch = bpf_map_lookup_elem(&wax_net_exec_path_scratch, &zero);
     if (exec_scratch) {
         exec_scratch->path[0] = '\0';
         executable_path = exec_scratch->path;

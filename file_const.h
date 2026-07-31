@@ -18,7 +18,7 @@
 /* Converts start_boottime to the units /proc/<pid>/stat reports. USER_HZ is 100
  * in the kernel's /proc ABI regardless of CONFIG_HZ, and fs/proc/array.c derives
  * starttime from the same start_boottime, so dividing here reproduces that field
- * exactly rather than approximately — which is what lets wdog prime pid_image
+ * exactly rather than approximately — which is what lets wdog prime wax_pid_image
  * from /proc and have the entries pass their own staleness check. */
 #define NSEC_PER_CLOCK 10000000ULL
 /* Policy IDs are typically 32-character strings; 39 bytes + NUL also covers

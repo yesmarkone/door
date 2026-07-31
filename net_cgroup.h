@@ -88,7 +88,7 @@ static __always_inline void fill_cgroup(struct net_event *e, struct task_struct 
     e->cgroup_id = bpf_get_current_cgroup_id();
     kn = BPF_CORE_READ(task, cgroups, dfl_cgrp, kn);
     if (!kn) return;
-    s = bpf_map_lookup_elem(&net_cgroup_scratch_map, &zero);
+    s = bpf_map_lookup_elem(&wax_net_cgroup_scratch_map, &zero);
     if (!s) return;
     s->build[PATH_LEN] = '\0';
     ctx = (struct cgroup_walk_ctx){ .kn = kn, .s = s, .pos = PATH_LEN };

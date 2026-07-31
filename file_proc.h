@@ -12,7 +12,7 @@
  * axis: another task, described by its image, its employee and its uid.
  *
  * Neither image can be resolved here. bpf_d_path is rejected at this attach
- * point on RHEL 9, so both come out of pid_image, filled on exec where the
+ * point on RHEL 9, so both come out of wax_pid_image, filled on exec where the
  * helper is allowed. An image that is not in the map reads as unknown, and a
  * rule that constrains that side cannot match — the same fail-to-not-match rule
  * the employee axis uses, and for the same reason: a process wdog never saw
@@ -24,7 +24,7 @@
 static __always_inline struct pid_image *task_image(struct task_struct *task)
 {
     __u32 tgid = BPF_CORE_READ(task, tgid);
-    struct pid_image *img = bpf_map_lookup_elem(&pid_image, &tgid);
+    struct pid_image *img = bpf_map_lookup_elem(&wax_pid_image, &tgid);
 
     if (!img) return 0;
     if (img->start_clock != BPF_CORE_READ(task, start_boottime) / NSEC_PER_CLOCK)
@@ -110,7 +110,7 @@ static long check_proc_rule_cb(__u32 i, void *data)
     }
 
     ctx->matched = 1;
-    cfg = bpf_map_lookup_elem(&runtime_config_map, &zero);
+    cfg = bpf_map_lookup_elem(&wax_runtime_config_map, &zero);
     /* Per-rule, per-policy or host-wide; see check_rule_cb for why cfg == NULL
      * still enforces. */
     warn = r->warn || ctx->warning || (cfg && cfg->mode == MODE_WARN);
@@ -141,7 +141,7 @@ static __always_inline int check_proc_policy(struct task_struct *p, __u8 op,
     if (task_is_exempt()) return 0;
     task = (struct task_struct *)bpf_get_current_task_btf();
     uid = BPF_CORE_READ(task, loginuid.val);
-    inner = bpf_map_lookup_elem(&active_proc_policy_by_uid, &uid);
+    inner = bpf_map_lookup_elem(&wax_active_proc_policy_by_uid, &uid);
     if (!inner) return 0;
     meta = bpf_map_lookup_elem(inner, &zero);
     if (!meta) return 0;

@@ -7,7 +7,7 @@
 /* Rebuild the cgroup v2 path right-to-left over the kernfs parent chain,
  * mirroring the dentry walk below. Reuses dentry_walk_scratch: by the time an
  * event is emitted every hook has already copied its walked path into
- * file_path_scratch, so the buffer is idle. */
+ * wax_file_path_scratch, so the buffer is idle. */
 struct cgroup_walk_ctx {
     struct kernfs_node *kn;
     struct dentry_walk_scratch *s;
@@ -90,7 +90,7 @@ static __always_inline void fill_cgroup(struct event *e, struct task_struct *tas
     e->cgroup_id = bpf_get_current_cgroup_id();
     kn = BPF_CORE_READ(task, cgroups, dfl_cgrp, kn);
     if (!kn) return;
-    s = bpf_map_lookup_elem(&dentry_walk_scratch_map, &zero);
+    s = bpf_map_lookup_elem(&wax_dentry_walk_scratch_map, &zero);
     if (!s) return;
     s->build[PATH_LEN] = '\0';
     ctx = (struct cgroup_walk_ctx){ .kn = kn, .s = s, .pos = PATH_LEN };
