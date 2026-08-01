@@ -27,6 +27,7 @@
 //   zero_event()    (retargeted at struct net_event)
 //   PATH_LEN / TTY_LEN / CMDLINE_LEN / POLICY_ID_LEN / MAX_RULES /
 //   MAX_CGROUP_DEPTH / MODE_ENFORCE / MODE_WARN
+//   NO_EVENT_SUCCESS / NO_EVENT_DENY / rule_emits()  file_const.h
 // ---------------------------------------------------------------------------
 #include "vmlinux.h"
 #include <bpf/bpf_core_read.h>
@@ -39,7 +40,7 @@
  * exactly. Nothing in these fragments is forward-declared — there is not a
  * single prototype in the whole object — so reordering them will not compile.
  * Each header names the line range it was lifted from. */
-#include "net_const.h"
+#include "net_const.h"    /* also rule_emits() */
 #include "net_types.h"
 #include "net_maps.h"
 #include "net_match.h"

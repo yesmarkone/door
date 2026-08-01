@@ -91,7 +91,9 @@ static long check_rule_cb(__u32 i, void *data)
     warn = r->warn || ctx->warning || (cfg && cfg->mode == MODE_WARN);
     denied = r->deny && !warn;
     status = r->deny ? (warn ? 'W' : 'F') : 'S';
-    if (!r->no_event) {
+    /* Both arms below carry the same status, so gating the pair is exactly a
+     * per-status gate; see rule_emits() in file_const.h. */
+    if (rule_emits(r->no_event, status)) {
         if (ctx->op == OP_EXEC && !denied)
             queue_exec_event(ctx->uid, status, ctx->path, ctx->policy_id, index);
         else

@@ -11,7 +11,7 @@
  * top-to-bottom order exactly. Nothing in these fragments is forward-declared —
  * there is not a single prototype in the whole object — so reordering them will
  * not compile. Each header names the line range it was lifted from. */
-#include "file_const.h"    /* also op_perm_mask() */
+#include "file_const.h"    /* also op_perm_mask(), rule_emits() */
 #include "file_types.h"
 #include "file_maps.h"
 #include "file_match.h"

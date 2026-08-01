@@ -67,4 +67,24 @@
 #define SIN6_ADDR_OFF 8
 #define SUN_PATH_OFF  2
 
+/* net_rule::no_event and ingress_rule::no_event are a two-bit mask over the
+ * status a match would report, not a flag. A matched rule reports 'S' when
+ * nothing was denied and 'F' or 'W' when a deny fired — 'W' where observe-only
+ * stood it down. Bit 0 drops the first, bit 1 drops the other two; 0 emits
+ * everything and 3 emits nothing. The loader rejects anything outside the two
+ * bits, so the byte is always 0..3 here.
+ *
+ * Copied from door/file_const.h; the two objects share no header. */
+#define NO_EVENT_SUCCESS 1  /* suppress 'S' */
+#define NO_EVENT_DENY    2  /* suppress 'F' and 'W' */
+
+/* The one place no_event is applied. Copied from door/file_const.h — see there
+ * for why the select costs the verifier nothing. Both callers here store the
+ * result on the context rather than acting on it: the emit happens after
+ * bpf_loop, so what the callback decided has to survive it. */
+static __always_inline int rule_emits(__u8 no_event, __u8 status)
+{
+    return !(no_event & (status == 'S' ? NO_EVENT_SUCCESS : NO_EVENT_DENY));
+}
+
 #endif /* DOOR_NET_CONST_H */

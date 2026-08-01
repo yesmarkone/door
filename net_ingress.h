@@ -62,8 +62,9 @@ static long check_ingress_rule_cb(__u32 i, void *data)
      * host is. cfg == NULL still enforces; see door.c's check_rule_cb. */
     warn = r->warn || ctx->warning || (cfg && cfg->mode == MODE_WARN);
     denied = r->deny && !warn;
+    /* Both survive bpf_loop together, and must; see check_net_rule_cb. */
     ctx->status = r->deny ? (warn ? 'W' : 'F') : 'S';
-    ctx->emit = !r->no_event;
+    ctx->emit = rule_emits(r->no_event, ctx->status);
     ctx->rule_slot = index;
     /* Any non-zero return makes tcp_conn_request() drop the SYN. The client
      * sees a timeout rather than a refusal — there is no way to answer from

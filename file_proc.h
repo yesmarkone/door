@@ -116,7 +116,7 @@ static long check_proc_rule_cb(__u32 i, void *data)
     warn = r->warn || ctx->warning || (cfg && cfg->mode == MODE_WARN);
     denied = r->deny && !warn;
     status = r->deny ? (warn ? 'W' : 'F') : 'S';
-    if (!r->no_event)
+    if (rule_emits(r->no_event, status))
         emit_event(ctx->uid, ctx->op, status, ctx->target_path ? ctx->target_path : "",
                    ctx->exec_path, ctx->policy_id, 1,
                    ctx->op == OP_KILL ? (__u8)ctx->sig : ctx->ptrace_mode, 0, index);

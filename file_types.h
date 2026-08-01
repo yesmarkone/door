@@ -39,7 +39,7 @@ struct rule {
     __u8 enabled;
     __u8 permission;
     __u8 deny;
-    __u8 no_event;
+    __u8 no_event;      /* NO_EVENT_* mask; see rule_emits() */
     __u8 exec_suffix_len;
     __u8 path_suffix_len;
     /* This one rule is observe-only; see struct policy_meta::warning for the
@@ -85,7 +85,7 @@ struct proc_rule {
     __u8 has_target_uid;            /* 596 — target_uid is meaningful */
     __u8 enabled;                   /* 597 */
     __u8 deny;                      /* 598 */
-    __u8 no_event;                  /* 599 */
+    __u8 no_event;                  /* 599 — NO_EVENT_* mask */
     __u8 exec_suffix_len;           /* 600 */
     __u8 target_suffix_len;         /* 601 */
     __u8 op_mask;                   /* 602 — PROC_OP_*_BIT; which ops this covers */
@@ -137,7 +137,7 @@ struct cred_rule {
     __u8 op_mask;                   /* 302 — CRED_OP_*_BIT; which ops this covers */
     __u8 enabled;                   /* 303 */
     __u8 deny;                      /* 304 */
-    __u8 no_event;                  /* 305 */
+    __u8 no_event;                  /* 305 — NO_EVENT_* mask */
     __u8 exec_suffix_len;           /* 306 */
     __u8 warn;                      /* 307 — this rule alone is observe-only */
 };                                  /* 308 */

@@ -148,7 +148,7 @@ static long check_cred_rule_cb(__u32 i, void *data)
     warn = r->warn || ctx->warning || (cfg && cfg->mode == MODE_WARN);
     denied = r->deny && !warn;
     status = r->deny ? (warn ? 'W' : 'F') : 'S';
-    if (!r->no_event) {
+    if (rule_emits(r->no_event, status)) {
         ids.from_id = from_id;
         ids.to_id = to_id;
         ids.flags = ctx->setid_flags;

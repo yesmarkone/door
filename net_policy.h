@@ -109,8 +109,10 @@ static long check_net_rule_cb(__u32 i, void *data)
      * door.c's check_rule_cb. */
     warn = r->warn || ctx->warning || (cfg && cfg->mode == MODE_WARN);
     denied = r->deny && !warn;
+    /* Both survive bpf_loop together, and must: no_event is judged against the
+     * status this rule decided, and the emit happens after the loop. */
     ctx->status = r->deny ? (warn ? 'W' : 'F') : 'S';
-    ctx->emit = !r->no_event;
+    ctx->emit = rule_emits(r->no_event, ctx->status);
     ctx->rule_slot = index;
     ctx->result = denied ? -13 /* EACCES */ : 0;
     return 1;   /* FIRST MATCH WINS */

@@ -151,4 +151,28 @@ static __always_inline __u8 op_perm_mask(__u8 op)
     }
 }
 
+/* rule::no_event is a two-bit mask over the status a match would report, not a
+ * flag. A matched rule reports 'S' when nothing was denied and 'F' or 'W' when a
+ * deny fired — 'W' where observe-only stood it down. Bit 0 drops the first, bit
+ * 1 drops the other two; 0 emits everything and 3 emits nothing. The loader
+ * rejects anything outside the two bits, so the byte is always 0..3 here.
+ *
+ * Duplicated in door/net_const.h; the two objects share no header. */
+#define NO_EVENT_SUCCESS 1  /* suppress 'S' */
+#define NO_EVENT_DENY    2  /* suppress 'F' and 'W' */
+
+/* The one place no_event is applied, at all five decision sites.
+ *
+ * Both arms of the select are compile-time constants, so this is a compare
+ * against an immediate on a register that is already live — status was computed
+ * two lines earlier from the same r->deny — then two immediate loads and an AND.
+ * It sits at the tail of a bpf_loop callback whose every path then falls into
+ * one `return 1`, so the verifier explores nothing twice: unlike the pointer
+ * branch struct rule::employee_id describes, this one is BEHIND both glob
+ * matchers rather than ahead of them. */
+static __always_inline int rule_emits(__u8 no_event, __u8 status)
+{
+    return !(no_event & (status == 'S' ? NO_EVENT_SUCCESS : NO_EVENT_DENY));
+}
+
 #endif /* DOOR_FILE_CONST_H */

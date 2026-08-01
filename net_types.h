@@ -27,7 +27,7 @@ struct net_rule {
     __u8 enabled;
     __u8 permission;    /* NPERM_* bitmask */
     __u8 deny;
-    __u8 no_event;
+    __u8 no_event;      /* NO_EVENT_* mask; see rule_emits() */
     __u8 exec_suffix_len;
     __u8 path_suffix_len;
     __u8 family;        /* 0=any, AF_UNIX 1, AF_INET 2, AF_INET6 10 */
@@ -184,7 +184,7 @@ struct ingress_rule {
     __u8 local_addr[16];    /* local (destination) prefix, v4-mapped */
     __u8 enabled;
     __u8 deny;
-    __u8 no_event;
+    __u8 no_event;          /* NO_EVENT_* mask; see rule_emits() */
     __u8 family;            /* 0=any, AF_INET 2, AF_INET6 10 */
     __u8 protocol;          /* 0=any, IPPROTO_TCP 6; only TCP arrives here today */
     __u8 src_prefix_len;    /* 0..128, or NET_ANY_PREFIX */
