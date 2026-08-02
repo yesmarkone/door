@@ -33,8 +33,8 @@ struct {
  * to door.c's declaration, or the second load fails on a layout mismatch. */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 4096);
-    __type(key, __u32); /* audit session id */
+    __uint(max_entries, 65536); /* KEEP IN SYNC with door/file_maps.h */
+    __type(key, __u32);         /* audit session id */
     __type(value, struct session_identity);
     __uint(pinning, LIBBPF_PIN_BY_NAME);
 } wax_session_identity SEC(".maps");

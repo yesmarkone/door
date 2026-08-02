@@ -112,10 +112,24 @@ struct {
  * A plain hash rather than an LRU on purpose: evicting a live session's record
  * would silently stop its name-scoped deny rules from matching. Overflow is
  * reported by PAM instead, and the reaper keeps the table from filling with
- * sessions that are already gone. */
+ * sessions that are already gone.
+ *
+ * 65536 rather than the 4096 this held originally, and the number is a security
+ * bound rather than a capacity estimate. Filling the table is REACHABLE: audit
+ * session ids are handed out one per login, the reaper needs two sweeps sixty
+ * seconds apart to collect a dead one, and pam_wood.c returns PAM_SUCCESS when
+ * the update fails — so roughly four thousand logins used to leave every
+ * subsequent session unidentified, with every employeeName-scoped rule quietly
+ * ceasing to match and nothing in the log but a PAM warning. At 72 bytes an
+ * entry this costs about 4.7MB and moves that threshold out of reach.
+ *
+ * Changing max_entries changes the pinned map's shape, so checkPin
+ * (cmd/wdog/session.go) refuses to start against a pin left by an older build.
+ * That refusal is correct and its message already carries the remedy; see the
+ * upgrade note in docs/deploy.md. */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 4096);
+    __uint(max_entries, 65536);
     __type(key, __u32); /* audit session id */
     __type(value, struct session_identity);
     __uint(pinning, LIBBPF_PIN_BY_NAME);

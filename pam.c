@@ -90,6 +90,17 @@ struct options {
 	 * that it also keeps the module from ever refusing a session — a login
 	 * always has an account name, so the name is never missing. */
 	int fallback_user;
+	/* strict refuses the session when the identity could not be recorded,
+	 * rather than letting the login proceed unidentified.
+	 *
+	 * Off by default, which keeps the module's stated philosophy: a machine
+	 * where wdog is not running should still be one people can log in to. But
+	 * the permissive default has a sharp edge worth an option — a FULL session
+	 * map fails exactly like a missing one, and from then on every login is
+	 * unidentified and every employeeName-scoped rule silently stops matching.
+	 * On a host where those rules are the control, `strict` turns that silent
+	 * fail-open into a refused login, which is loud and recoverable. */
+	int strict;
 };
 
 static void parse_options(struct options *o, int argc, const char **argv)
@@ -98,6 +109,7 @@ static void parse_options(struct options *o, int argc, const char **argv)
 	o->env_name = DEFAULT_ENV_NAME;
 	o->debug = 0;
 	o->fallback_user = 0;
+	o->strict = 0;
 	for (int i = 0; i < argc; i++) {
 		if (!strncmp(argv[i], "map=", 4))
 			o->map_path = argv[i] + 4;
@@ -107,6 +119,8 @@ static void parse_options(struct options *o, int argc, const char **argv)
 			o->debug = 1;
 		else if (!strcmp(argv[i], "fallback=user"))
 			o->fallback_user = 1;
+		else if (!strcmp(argv[i], "strict"))
+			o->strict = 1;
 	}
 }
 
@@ -213,7 +227,16 @@ int pam_sm_open_session(pam_handle_t *pamh, int flags, int argc, const char **ar
 
 	fd = map_open(o.map_path);
 	if (fd < 0) {
+		/* This line is worth reading twice. It is what an operator sees when
+		 * wdog is simply not running — and it is ALSO what they see when an
+		 * attacker has deleted the pin to switch the employee axis off, because
+		 * from here the two are indistinguishable. `strict` is what lets a host
+		 * refuse to guess. */
 		pam_syslog(pamh, LOG_WARNING, "opening %s: %m (is wdog running?)", o.map_path);
+		if (o.strict) {
+			pam_error(pamh, "Login denied: this account requires an identified user.");
+			return PAM_SESSION_ERR;
+		}
 		return PAM_SUCCESS;
 	}
 
@@ -246,6 +269,11 @@ int pam_sm_open_session(pam_handle_t *pamh, int flags, int argc, const char **ar
 				   o.map_path);
 		else
 			pam_syslog(pamh, LOG_INFO, "recording session %ld: %m", sid);
+		if (o.strict) {
+			close(fd);
+			pam_error(pamh, "Login denied: this account requires an identified user.");
+			return PAM_SESSION_ERR;
+		}
 	} else if (o.debug) {
 		pam_syslog(pamh, LOG_INFO, "session %ld (uid %ld) recorded as %s",
 			   sid, uid, id.employee_name);
