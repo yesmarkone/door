@@ -67,24 +67,30 @@
 #define SIN6_ADDR_OFF 8
 #define SUN_PATH_OFF  2
 
-/* net_rule::no_event and ingress_rule::no_event are a two-bit mask over the
- * status a match would report, not a flag. A matched rule reports 'S' when
- * nothing was denied and 'F' or 'W' when a deny fired — 'W' where observe-only
- * stood it down. Bit 0 drops the first, bit 1 drops the other two; 0 emits
- * everything and 3 emits nothing. The loader rejects anything outside the two
- * bits, so the byte is always 0..3 here.
+/* net_rule::no_event_s and ::no_event_fw are masks over the NPERM_* bits,
+ * naming the operations whose 'S', and whose 'F' and 'W', this rule does not
+ * report. Per operation, not per rule: a rule carrying NPERM_BIND|NPERM_LISTEN
+ * can drop the bind noise and keep the listen record.
+ *
+ * ingress_rule::no_event is the exception and still carries the two status bits
+ * below. An ingress rule judges one operation class, so there is no axis to key
+ * a mask on; net_ingress.h expands the pair at the one call site.
  *
  * Copied from door/file_const.h; the two objects share no header. */
 #define NO_EVENT_SUCCESS 1  /* suppress 'S' */
 #define NO_EVENT_DENY    2  /* suppress 'F' and 'W' */
 
-/* The one place no_event is applied. Copied from door/file_const.h — see there
- * for why the select costs the verifier nothing. Both callers here store the
- * result on the context rather than acting on it: the emit happens after
- * bpf_loop, so what the callback decided has to survive it. */
-static __always_inline int rule_emits(__u8 no_event, __u8 status)
+/* The one place the two masks are applied. Copied from door/file_const.h — see
+ * there for what eff is, why silence takes naming every demanded operation, and
+ * why the select costs the verifier nothing. Both callers here store the result
+ * on the context rather than acting on it: the emit happens after bpf_loop, so
+ * what the callback decided has to survive it. */
+static __always_inline int rule_emits(__u8 eff, __u8 no_event_s,
+                                      __u8 no_event_fw, __u8 status)
 {
-    return !(no_event & (status == 'S' ? NO_EVENT_SUCCESS : NO_EVENT_DENY));
+    __u8 suppressed = (status == 'S') ? no_event_s : no_event_fw;
+
+    return (eff & ~suppressed) != 0;
 }
 
 #endif /* DOOR_NET_CONST_H */

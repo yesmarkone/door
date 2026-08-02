@@ -27,7 +27,9 @@ struct net_rule {
     __u8 enabled;
     __u8 permission;    /* NPERM_* bitmask */
     __u8 deny;
-    __u8 no_event;      /* NO_EVENT_* mask; see rule_emits() */
+    /* NPERM_* masks, not status bits: the operations whose 'S', and whose 'F'
+     * and 'W', this rule does not report. See rule_emits(). */
+    __u8 no_event_s;
     __u8 exec_suffix_len;
     __u8 path_suffix_len;
     __u8 family;        /* 0=any, AF_UNIX 1, AF_INET 2, AF_INET6 10 */
@@ -37,7 +39,9 @@ struct net_rule {
     /* This one rule is observe-only; see door.c's struct policy_meta for the
      * three scopes. Came out of the tail padding, so port_min did not move. */
     __u8 warn;
-    __u8 _pad[1];
+    /* Took the byte warn left, on the same terms: port_min still does not move
+     * and the size below is unchanged. */
+    __u8 no_event_fw;
     __u16 port_min;     /* host byte order, inclusive */
     __u16 port_max;
 };
@@ -184,7 +188,11 @@ struct ingress_rule {
     __u8 local_addr[16];    /* local (destination) prefix, v4-mapped */
     __u8 enabled;
     __u8 deny;
-    __u8 no_event;          /* NO_EVENT_* mask; see rule_emits() */
+    /* The two status bits, NOT the per-operation masks net_rule carries: an
+     * ingress rule judges one operation class, so there is no axis to key a
+     * mask on. check_ingress_rule_cb expands this into the pair rule_emits()
+     * takes; see net_const.h. */
+    __u8 no_event;          /* NO_EVENT_* status mask */
     __u8 family;            /* 0=any, AF_INET 2, AF_INET6 10 */
     __u8 protocol;          /* 0=any, IPPROTO_TCP 6; only TCP arrives here today */
     __u8 src_prefix_len;    /* 0..128, or NET_ANY_PREFIX */
@@ -248,11 +256,14 @@ struct net_cgroup_scratch {
  * pins the sizes in net_test.go, so a silent layout change here would corrupt
  * policy and events rather than fail to build. */
 _Static_assert(sizeof(struct net_rule) == 612, "struct net_rule must stay 612 bytes");
-/* sizeof cannot catch two adjacent __u8s swapping places, and deny, no_event and
- * warn are now three indistinguishable bytes whose meanings are not
- * interchangeable. Same treatment as door.c's struct rule. */
+/* sizeof cannot catch two adjacent __u8s swapping places, and deny, no_event_s,
+ * warn and no_event_fw are four indistinguishable bytes whose meanings are not
+ * interchangeable. Same treatment as door.c's struct rule. no_event_fw took the
+ * struct's last padding byte, so the next flag added here moves port_min. */
 _Static_assert(__builtin_offsetof(struct net_rule, warn) == 606,
                "net_rule.warn must stay at offset 606 (cmd/wdog/net.go)");
+_Static_assert(__builtin_offsetof(struct net_rule, no_event_fw) == 607,
+               "net_rule.no_event_fw must stay at offset 607 (cmd/wdog/net.go)");
 _Static_assert(sizeof(struct net_event) == 1472, "struct net_event must stay 1472 bytes");
 _Static_assert(sizeof(struct net_event) % 8 == 0, "zero_net_event needs a multiple of 8");
 /* rule_slot took over a hole that already existed, which is why the 1472 above

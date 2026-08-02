@@ -148,7 +148,8 @@ static long check_cred_rule_cb(__u32 i, void *data)
     warn = r->warn || ctx->warning || (cfg && cfg->mode == MODE_WARN);
     denied = r->deny && !warn;
     status = r->deny ? (warn ? 'W' : 'F') : 'S';
-    if (rule_emits(r->no_event, status)) {
+    /* One of CRED_OP_SETUID_BIT or CRED_OP_SETGID_BIT; see check_proc_rule_cb. */
+    if (rule_emits(r->op_mask & ctx->op_bit, r->no_event_s, r->no_event_fw, status)) {
         ids.from_id = from_id;
         ids.to_id = to_id;
         ids.flags = ctx->setid_flags;

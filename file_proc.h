@@ -116,7 +116,10 @@ static long check_proc_rule_cb(__u32 i, void *data)
     warn = r->warn || ctx->warning || (cfg && cfg->mode == MODE_WARN);
     denied = r->deny && !warn;
     status = r->deny ? (warn ? 'W' : 'F') : 'S';
-    if (rule_emits(r->no_event, status))
+    /* op_mask & op_bit, the same gate this callback opened with: one of
+     * PROC_OP_KILL_BIT or PROC_OP_PTRACE_BIT, never both, because a check
+     * judges one operation. */
+    if (rule_emits(r->op_mask & ctx->op_bit, r->no_event_s, r->no_event_fw, status))
         emit_event(ctx->uid, ctx->op, status, ctx->target_path ? ctx->target_path : "",
                    ctx->exec_path, ctx->policy_id, 1,
                    ctx->op == OP_KILL ? (__u8)ctx->sig : ctx->ptrace_mode, 0, index);

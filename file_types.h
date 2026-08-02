@@ -39,14 +39,20 @@ struct rule {
     __u8 enabled;
     __u8 permission;
     __u8 deny;
-    __u8 no_event;      /* NO_EVENT_* mask; see rule_emits() */
+    /* PERM_* masks, not status bits: the operations whose 'S' this rule does
+     * not report. Same offset the whole-rule status mask used to sit at, and
+     * deliberately so — see rule_emits(). */
+    __u8 no_event_s;
     __u8 exec_suffix_len;
     __u8 path_suffix_len;
     /* This one rule is observe-only; see struct policy_meta::warning for the
      * three scopes and how they combine. Came out of the tail padding, so no
      * field moved and the size below did not change. */
     __u8 warn;
-    __u8 _pad[1];
+    /* The operations whose 'F' and 'W' this rule does not report. Took the last
+     * padding byte on the same terms warn took the one before it, so no field
+     * moved and the size below still did not change. */
+    __u8 no_event_fw;
 };
 
 /* The userspace loader writes this by byte offset (cmd/wdog/file.go) and
@@ -54,10 +60,16 @@ struct rule {
  * to the wrong fields rather than fail to build. */
 _Static_assert(sizeof(struct rule) == 588, "struct rule must stay 588 bytes");
 /* sizeof alone cannot catch two adjacent __u8s swapping places, and deny,
- * no_event and warn are now three indistinguishable bytes in a row whose
- * meanings are not interchangeable. Pin the one that was added last. */
+ * no_event_s, warn and no_event_fw are four indistinguishable bytes whose
+ * meanings are not interchangeable. Pin the two added last.
+ *
+ * no_event_fw is worth pinning for a second reason: it consumed the struct's
+ * last padding byte, so the next flag added here grows struct rule to 592 and
+ * therefore the map's value size, which the loader's Put rejects outright. */
 _Static_assert(__builtin_offsetof(struct rule, warn) == 586,
                "rule.warn must stay at offset 586 (cmd/wdog/file.go)");
+_Static_assert(__builtin_offsetof(struct rule, no_event_fw) == 587,
+               "rule.no_event_fw must stay at offset 587 (cmd/wdog/file.go)");
 
 /* A signal rule. Deliberately not struct rule: the thing being acted on is
  * another process, so the constraints describe a task rather than a path.
@@ -85,21 +97,25 @@ struct proc_rule {
     __u8 has_target_uid;            /* 596 — target_uid is meaningful */
     __u8 enabled;                   /* 597 */
     __u8 deny;                      /* 598 */
-    __u8 no_event;                  /* 599 — NO_EVENT_* mask */
+    __u8 no_event_s;                /* 599 — PROC_OP_* mask: ops with no 'S' */
     __u8 exec_suffix_len;           /* 600 */
     __u8 target_suffix_len;         /* 601 */
     __u8 op_mask;                   /* 602 — PROC_OP_*_BIT; which ops this covers */
     __u8 ptrace_mode;               /* 603 — OP_PTRACE only; 0 = any mode */
     __u8 warn;                      /* 604 — this rule alone is observe-only */
-    __u8 _pad[3];                   /* 605 */
+    __u8 no_event_fw;               /* 605 — PROC_OP_* mask: ops with no 'F'/'W' */
+    __u8 _pad[2];                   /* 606 */
 };                                  /* 608 */
 
 /* The two bytes came out of the tail padding, so the process controls did not
  * move a single field of the file rule they were modelled on. warn later came
- * out of the same padding, on the same terms. */
+ * out of the same padding, on the same terms, and no_event_fw after it —
+ * this struct is the one that still has room to spare. */
 _Static_assert(sizeof(struct proc_rule) == 608, "struct proc_rule must stay 608 bytes");
 _Static_assert(__builtin_offsetof(struct proc_rule, warn) == 604,
                "proc_rule.warn must stay at offset 604 (cmd/wdog/file.go)");
+_Static_assert(__builtin_offsetof(struct proc_rule, no_event_fw) == 605,
+               "proc_rule.no_event_fw must stay at offset 605 (cmd/wdog/file.go)");
 
 /* A credential-switch rule: the task changing its OWN user or group identity,
  * which is what su and sudo do once they are running.
@@ -137,18 +153,28 @@ struct cred_rule {
     __u8 op_mask;                   /* 302 — CRED_OP_*_BIT; which ops this covers */
     __u8 enabled;                   /* 303 */
     __u8 deny;                      /* 304 */
-    __u8 no_event;                  /* 305 — NO_EVENT_* mask */
+    __u8 no_event_s;                /* 305 — CRED_OP_* mask: ops with no 'S' */
     __u8 exec_suffix_len;           /* 306 */
     __u8 warn;                      /* 307 — this rule alone is observe-only */
-};                                  /* 308 */
+    __u8 no_event_fw;               /* 308 — CRED_OP_* mask: ops with no 'F'/'W' */
+    __u8 _pad[3];                   /* 309 */
+};                                  /* 312 */
 
-/* warn took the last padding byte: 308 is 4·77 and employee_id forces 4-byte
- * alignment, so the struct is now exactly full. The next flag added here costs
- * four bytes, not one, and that does change the map's value size — which the
- * loader's Put will reject outright rather than accept silently. */
-_Static_assert(sizeof(struct cred_rule) == 308, "struct cred_rule must stay 308 bytes");
+/* warn took what had been the last padding byte, and no_event_fw is the field
+ * the comment there predicted: 308 was 4·77 and employee_id forces 4-byte
+ * alignment, so one more byte cost four and grew the map's value size.
+ *
+ * That growth is the design working, not a cost worked around. It is the only
+ * observable signal that a wdog carrying per-operation noEvent is talking to a
+ * BPF object that predates it — the other four rule structs kept their sizes —
+ * and the loader turns it into a refusal to start rather than a policy applied
+ * against bytes the kernel reads as something else. See checkObjectABI in
+ * cmd/wdog/file.go. */
+_Static_assert(sizeof(struct cred_rule) == 312, "struct cred_rule must stay 312 bytes");
 _Static_assert(__builtin_offsetof(struct cred_rule, warn) == 307,
                "cred_rule.warn must stay at offset 307 (cmd/wdog/file.go)");
+_Static_assert(__builtin_offsetof(struct cred_rule, no_event_fw) == 308,
+               "cred_rule.no_event_fw must stay at offset 308 (cmd/wdog/file.go)");
 
 /* Slot 0 of every inner policy map. warning makes the whole policy
  * observe-only: its deny rules are allowed through and reported 'W' instead of

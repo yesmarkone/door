@@ -91,9 +91,13 @@ static long check_rule_cb(__u32 i, void *data)
     warn = r->warn || ctx->warning || (cfg && cfg->mode == MODE_WARN);
     denied = r->deny && !warn;
     status = r->deny ? (warn ? 'W' : 'F') : 'S';
-    /* Both arms below carry the same status, so gating the pair is exactly a
-     * per-status gate; see rule_emits() in file_const.h. */
-    if (rule_emits(r->no_event, status)) {
+    /* Both arms below carry the same status, so gating the pair is exactly the
+     * per-status gate rule_emits() applies; see file_const.h. The first
+     * argument is the same intersection that let this rule match, recomputed
+     * rather than stashed on the context because it is one AND on registers
+     * already live and ctx is read by every callback iteration. */
+    if (rule_emits(r->permission & ctx->perm_mask, r->no_event_s,
+                   r->no_event_fw, status)) {
         if (ctx->op == OP_EXEC && !denied)
             queue_exec_event(ctx->uid, status, ctx->path, ctx->policy_id, index);
         else

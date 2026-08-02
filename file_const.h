@@ -151,28 +151,51 @@ static __always_inline __u8 op_perm_mask(__u8 op)
     }
 }
 
-/* rule::no_event is a two-bit mask over the status a match would report, not a
- * flag. A matched rule reports 'S' when nothing was denied and 'F' or 'W' when a
- * deny fired — 'W' where observe-only stood it down. Bit 0 drops the first, bit
- * 1 drops the other two; 0 emits everything and 3 emits nothing. The loader
- * rejects anything outside the two bits, so the byte is always 0..3 here.
+/* A rule suppresses events per operation, not for the rule as a whole: a rule
+ * carrying PERM_READ|PERM_WRITE can drop the read noise and keep the write
+ * record. no_event_s and no_event_fw are therefore masks in the rule's OWN
+ * operation namespace — permission bits for struct rule and net_rule, op_mask
+ * bits for proc_rule and cred_rule — naming the operations whose 'S', and whose
+ * 'F' and 'W', are not reported.
+ *
+ * The status bits below are the userspace spelling of the same thing, and are
+ * still what ingress_rule::no_event carries: an ingress rule judges one
+ * operation class, so it has no axis to key on. See net_ingress.h, which is the
+ * one caller that expands them.
+ *
+ * The loader writes both masks from model.NoEvent, which accepts either the old
+ * number — one status mask over every operation the rule covers — or an object
+ * naming operations one at a time. The number is not a legacy path: it expands
+ * to exactly the mask the rule already carries, so the two spellings agree bit
+ * for bit where they overlap.
  *
  * Duplicated in door/net_const.h; the two objects share no header. */
 #define NO_EVENT_SUCCESS 1  /* suppress 'S' */
 #define NO_EVENT_DENY    2  /* suppress 'F' and 'W' */
 
-/* The one place no_event is applied, at all five decision sites.
+/* The one place the two masks are applied, at all five decision sites.
  *
- * Both arms of the select are compile-time constants, so this is a compare
- * against an immediate on a register that is already live — status was computed
- * two lines earlier from the same r->deny — then two immediate loads and an AND.
- * It sits at the tail of a bpf_loop callback whose every path then falls into
- * one `return 1`, so the verifier explores nothing twice: unlike the pointer
- * branch struct rule::employee_id describes, this one is BEHIND both glob
- * matchers rather than ahead of them. */
-static __always_inline int rule_emits(__u8 no_event, __u8 status)
+ * eff is the operations THIS check demanded that the rule also carries — the
+ * same intersection that let the rule match, so it is never zero here. Emit
+ * unless every one of those operations is suppressed: silence takes naming all
+ * of them, and a rule that half-suppresses still speaks. That matters for the
+ * destination side of a rename, which demands PERM_WRITE|PERM_DELETE at once
+ * (see op_perm_mask) — suppressing only write leaves the delete side reporting,
+ * which is the same fail-loud direction op_perm_mask itself chose.
+ *
+ * Cost over the flag it replaces: one more byte loaded and one AND-NOT. Both
+ * arms of the select are still compile-time-constant field offsets on a struct
+ * already in registers, and status was computed two lines earlier from the same
+ * r->deny. It sits at the tail of a bpf_loop callback whose every path then
+ * falls into one `return 1`, so the verifier explores nothing twice: unlike the
+ * pointer branch struct rule::employee_id describes, this one is BEHIND both
+ * glob matchers rather than ahead of them. */
+static __always_inline int rule_emits(__u8 eff, __u8 no_event_s,
+                                      __u8 no_event_fw, __u8 status)
 {
-    return !(no_event & (status == 'S' ? NO_EVENT_SUCCESS : NO_EVENT_DENY));
+    __u8 suppressed = (status == 'S') ? no_event_s : no_event_fw;
+
+    return (eff & ~suppressed) != 0;
 }
 
 #endif /* DOOR_FILE_CONST_H */

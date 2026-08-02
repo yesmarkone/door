@@ -109,10 +109,13 @@ static long check_net_rule_cb(__u32 i, void *data)
      * door.c's check_rule_cb. */
     warn = r->warn || ctx->warning || (cfg && cfg->mode == MODE_WARN);
     denied = r->deny && !warn;
-    /* Both survive bpf_loop together, and must: no_event is judged against the
-     * status this rule decided, and the emit happens after the loop. */
+    /* Both survive bpf_loop together, and must: the no_event masks are judged
+     * against the status this rule decided, and the emit happens after the
+     * loop. perm_bit really is one bit here — unlike door.c's perm_mask — so
+     * the intersection is that bit or nothing, and it matched. */
     ctx->status = r->deny ? (warn ? 'W' : 'F') : 'S';
-    ctx->emit = rule_emits(r->no_event, ctx->status);
+    ctx->emit = rule_emits(r->permission & ctx->perm_bit, r->no_event_s,
+                           r->no_event_fw, ctx->status);
     ctx->rule_slot = index;
     ctx->result = denied ? -13 /* EACCES */ : 0;
     return 1;   /* FIRST MATCH WINS */
