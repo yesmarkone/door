@@ -9,7 +9,7 @@
 // Three properties, and only the first is about tidiness:
 //
 //  1. ARMING LATENCY. Verifying the file object takes the better part of a
-//     minute, nearly all of it verifier time (cmd/agent/main.go:175). Until it
+//     minute, nearly all of it verifier time (cmd/wagent/main.go:175). Until it
 //     finishes, `pkill wdog` and `bpftool map delete` both work. This object has
 //     no bpf_loop over policy, no bpf_d_path, no glob matcher and no 1440-byte
 //     event, so it loads and attaches in about a second — and wdog attaches it

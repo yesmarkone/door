@@ -21,7 +21,7 @@ long BPF_PROG(wax_self_kill, struct task_struct *p, struct kernel_siginfo *info,
     if (!t) return 0; /* not one of ours, so not our business */
     if (self_trusted()) return 0;
     /* PID 1 is the documented escape hatch, and the ONLY signal path this layer
-     * leaves open by default: `systemctl stop libwdoor` has to keep working,
+     * leaves open by default: `systemctl stop wagent` has to keep working,
      * which is what docs/rules-process.md has always promised. --self-kill=strict
      * closes it, and then the way out is the signed unseal or a reboot — the
      * latter works regardless, because reboot(2) is not a signal.
@@ -314,7 +314,7 @@ long BPF_PROG(wax_self_mkdir, const struct path *dir, struct dentry *dentry,
  * engine attaches to inode_mknod (door/file_progs.h:107) and therefore cannot
  * see a pin being created. That is the second half of an attack whose first
  * half is deleting the real one: plant a decoy map at
- * /sys/fs/bpf/libwdoor/wax_session_identity with matching geometry, and
+ * /sys/fs/bpf/wax/wax_session_identity with matching geometry, and
  * pam_wood.so writes identities into it while wdog reads the real map — or,
  * after a wdog restart, LIBBPF_PIN_BY_NAME attaches wdog to the attacker's map
  * and checkPin's geometry comparison passes it silently (cmd/wdog/session.go).
