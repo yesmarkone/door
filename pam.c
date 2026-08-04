@@ -55,6 +55,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 #include <linux/bpf.h>
 #include <sys/syscall.h>
@@ -73,12 +74,25 @@
 
 /* Mirrors struct session_identity in door/file.c. login_uid is not a matching
  * criterion; it lets the kernel discard a record left behind by a session whose
- * id has since been reused. */
+ * id has since been reused. login_time_ns is written here and read only by
+ * wdog, to stamp its audit lines with when the session logged in; zero means
+ * "not recorded" and wdog approximates it from /proc instead.
+ *
+ * The size is an interface, and an unusually unforgiving one: BPF_MAP_UPDATE_ELEM
+ * carries no value size, so the kernel copies map->value_size bytes from the
+ * address below whatever this module believes that struct is. A module built
+ * against an older layout therefore hands a newer map eight bytes of this
+ * function's stack with no error anywhere. Hence the assert, and hence the rule
+ * that this module ships with the daemons rather than on its own schedule. */
 struct session_identity {
 	char employee_name[EMPLOYEE_NAME_LEN];
 	uint32_t login_uid;
 	uint32_t _pad;
+	uint64_t login_time_ns;
 };
+
+_Static_assert(sizeof(struct session_identity) == 80,
+	       "must match struct session_identity in door/file_types.h");
 
 struct options {
 	const char *map_path;
@@ -175,6 +189,24 @@ static long current_login_uid(void)
 	return read_proc_u32("/proc/self/loginuid");
 }
 
+/* The wall clock now, in nanoseconds since the epoch — the moment this login is
+ * being opened, which is the closest thing to a login time anything on the host
+ * knows exactly.
+ *
+ * Zero on failure, which is deliberately the same value an older module's record
+ * carries: wdog reads zero as "not recorded" and falls back to deriving the time
+ * from /proc. So there is nothing to report and nothing to refuse here. In
+ * practice clock_gettime(CLOCK_REALTIME) is a vDSO call that cannot fail with a
+ * valid clock id and a valid pointer; the check is belt and braces. */
+static uint64_t now_realtime_ns(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_REALTIME, &ts) != 0)
+		return 0;
+	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
 int pam_sm_open_session(pam_handle_t *pamh, int flags, int argc, const char **argv)
 {
 	struct options o;
@@ -252,6 +284,7 @@ int pam_sm_open_session(pam_handle_t *pamh, int flags, int argc, const char **ar
 	 * loader rejects rules above the same bound, so the two agree. */
 	strncpy(id.employee_name, name, EMPLOYEE_NAME_LEN - 1);
 	id.login_uid = (uint32_t)uid;
+	id.login_time_ns = now_realtime_ns();
 	key = (uint32_t)sid;
 
 	memset(&attr, 0, sizeof(attr));

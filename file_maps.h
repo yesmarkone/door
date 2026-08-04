@@ -120,8 +120,8 @@ struct {
  * seconds apart to collect a dead one, and pam_wood.c returns PAM_SUCCESS when
  * the update fails — so roughly four thousand logins used to leave every
  * subsequent session unidentified, with every employeeName-scoped rule quietly
- * ceasing to match and nothing in the log but a PAM warning. At 72 bytes an
- * entry this costs about 4.7MB and moves that threshold out of reach.
+ * ceasing to match and nothing in the log but a PAM warning. At 80 bytes an
+ * entry this costs about 5.2MB and moves that threshold out of reach.
  *
  * Changing max_entries changes the pinned map's shape, so checkPin
  * (cmd/wdog/session.go) refuses to start against a pin left by an older build.

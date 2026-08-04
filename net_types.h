@@ -67,7 +67,14 @@ struct session_identity {
     char employee_name[EMPLOYEE_NAME_LEN];
     __u32 login_uid;
     __u32 _pad;
+    __u64 login_time_ns;
 };
+
+_Static_assert(sizeof(struct session_identity) == 80,
+               "session_identity is the pinned wax_session_identity value; its size is an "
+               "interface with pam/pam.c and cmd/wdog/session.go");
+_Static_assert(__builtin_offsetof(struct session_identity, login_time_ns) == 72,
+               "session_identity.login_time_ns must stay at offset 72 (pam/pam.c)");
 
 struct employee_name_key {
     char name[EMPLOYEE_NAME_LEN];

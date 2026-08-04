@@ -252,15 +252,39 @@ struct pid_image {
  * a session whose id has since been reused cannot lend its name to a different
  * user.
  *
+ * login_time_ns is the wall clock at open_session, CLOCK_REALTIME nanoseconds
+ * since the epoch. Nothing in the kernel reads it — it exists so wdog can stamp
+ * the audit line with when the session behind an event logged in. Zero means
+ * "not recorded": either an older pam_wood.so wrote this record, or the module
+ * could not read a clock. wdog then derives an approximation from /proc and
+ * never writes it back here; this map is written by PAM alone, and the
+ * self-defense layer (door/self_progs.h) is built on that.
+ *
  * INVARIANT: employee_name must be zero-padded to its full width, not merely
  * NUL-terminated. It is used as a hash-map key below, and a key is compared as
  * a fixed-size block of bytes — junk after the terminator would look up nothing
- * at all. pam_wood.c memsets the value before filling it for this reason. */
+ * at all. pam_wood.c memsets the value before filling it for this reason.
+ *
+ * _pad stays although login_time_ns could have taken half of it. It keeps the
+ * C layout free of implicit holes, which is what lets cmd/wdog/session.go's
+ * mirror be copied whole rather than field by field. */
 struct session_identity {
     char employee_name[EMPLOYEE_NAME_LEN];
     __u32 login_uid;
     __u32 _pad;
+    __u64 login_time_ns;
 };
+
+/* This value crosses three build systems — this object, door/net.c, and
+ * pam/pam.c, which is compiled separately and gets no word from the kernel when
+ * it is wrong (BPF_MAP_UPDATE_ELEM copies map->value_size bytes from wherever
+ * the module points, whatever the module thinks the size is). The asserts are
+ * what catches a mirror drifting; see cmd/wdog/session.go for the fourth. */
+_Static_assert(sizeof(struct session_identity) == 80,
+               "session_identity is the pinned wax_session_identity value; its size is an "
+               "interface with pam/pam.c and cmd/wdog/session.go");
+_Static_assert(__builtin_offsetof(struct session_identity, login_time_ns) == 72,
+               "session_identity.login_time_ns must stay at offset 72 (pam/pam.c)");
 
 /* Key of the intern table: a name, padded to a fixed width so it can be hashed.
  * Deliberately the same layout as session_identity's leading field, so a
