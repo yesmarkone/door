@@ -103,11 +103,27 @@ long BPF_PROG(wax_self_bpf_map, struct bpf_map *map, fmode_t fmode)
      *
      * It is the only access this layer permits, so it is the only access that
      * needs watching: every non-trusted open is reported. PAM produces one per
-     * login, which is a low enough baseline that a burst is visible. */
+     * login, which is a low enough baseline that a burst is visible.
+     *
+     * The event stays even though wax_self_bpf now names the command that
+     * follows, and it has to. An open that issues no recognized command —
+     * `bpftool map dump` reading every employee name on the host — would
+     * otherwise produce nothing at all, and that coverage is the entire
+     * justification for permitting the exception. The cost is a second line per
+     * login, which at a few logins an hour is not a volume anyone will notice. */
     __builtin_memcpy(&pfx8, name, 8);
     if (pfx8 == self_session_map_prefix) {
-        emit_self_event(SOP_BPF_MAP, SKIND_PIN, 'W', 0, 0,
-                        BPF_CORE_READ(map, id), (__u8)fmode);
+        __u64 tid = bpf_get_current_pid_tgid();
+        struct self_pin_open o = {};
+
+        /* Remember the fd so the next map command from this thread can be named.
+         * A full or evicting map costs a MISSING login event, never a wrong one:
+         * nothing downstream invents a session out of an absent entry. */
+        o.at_ns = bpf_ktime_get_ns();
+        o.map_id = BPF_CORE_READ(map, id);
+        bpf_map_update_elem(&wax_self_pin_opens, &tid, &o, BPF_ANY);
+        emit_self_event(SOP_BPF_MAP, SKIND_PIN, 'W', 0, 0, o.map_id,
+                        (__u8)fmode);
         return 0;
     }
     return lsm_ret(self_deny(SOP_BPF_MAP, SKIND_MAP, 0, 0,
@@ -129,13 +145,35 @@ long BPF_PROG(wax_self_bpf_prog, struct bpf_prog *prog)
                              BPF_CORE_READ(prog, aux, id), 0));
 }
 
-/* The cmd-level hook, which exists for exactly one thing the two above cannot
- * see: LINKS. bpf_link_new_fd() calls anon_inode_getfd() directly — there is no
- * security_bpf_link() in this kernel — so a link fd can only be gated here. */
+/* The cmd-level hook, which exists for two things the two above cannot see.
+ *
+ * LINKS: bpf_link_new_fd() calls anon_inode_getfd() directly — there is no
+ * security_bpf_link() in this kernel — so a link fd can only be gated here.
+ *
+ * And the COMMAND ITSELF, which is what separates a login from a logout: both
+ * arrive at wax_self_bpf_map as the identical fd on the identical map, and only
+ * BPF_MAP_UPDATE_ELEM versus BPF_MAP_DELETE_ELEM tells them apart. */
 SEC("lsm/bpf")
 long BPF_PROG(wax_self_bpf, int cmd, union bpf_attr *attr, unsigned int size)
 {
     if (self_disarmed()) return 0;
+
+    /* First, because these two commands are the hot ones on this host: wdog
+     * issues thousands of BPF_MAP_UPDATE_ELEM on every ReplacePolicies. It pays
+     * one lookup in the 16-entry wax_self_tasks and stops — the same lookup
+     * wax_self_kill already makes for every signal sent anywhere on the system.
+     *
+     * self_trusted() before the scratch lookup rather than after is also a proof
+     * obligation, not a preference: it is what makes it structurally impossible
+     * for wdog's OWN session-map delete — the reaper collecting a dead session,
+     * cmd/wdog/session.go — to be reported as a logout. That reaper emits its
+     * own event, and this is the half that keeps the two from doubling up. */
+    if (cmd == BPF_MAP_UPDATE_ELEM || cmd == BPF_MAP_DELETE_ELEM) {
+        if (!self_session_map_prefix) return 0; /* .rodata; folded away */
+        if (self_trusted()) return 0;
+        self_session_record(cmd, attr);
+        return 0;
+    }
 
     /* Trampoline-slot squatting. A BPF LSM hook holds a bounded number of
      * programs, so an attacker who fills bpf_lsm_file_open with dummies before
@@ -372,7 +410,13 @@ long BPF_PROG(wax_self_mount, const char *dev_name, const struct path *path,
     /* `mount --bind /tmp/evil /usr/sbin/wdog` hides the binary; so does the same
      * over /usr/sbin, and that costs the attacker one word less. The loader
      * therefore publishes every protected object's ancestor directories with
-     * SELF_NO_MOUNT, which is why this is a self_guard and not a bare lookup. */
+     * SELF_NO_MOUNT of their own, and that is what covers the second form.
+     *
+     * So the mount point is judged BY ITSELF, with no walk toward the root. The
+     * walk would answer a different question — "is this somewhere inside a
+     * protected directory" — and every mount under /run or on the root
+     * filesystem answers it yes. See self_ancestor_applies (door/self_check.h)
+     * for what that cost before it was taken out. */
     struct dentry *d = BPF_CORE_READ(path, dentry);
 
     return lsm_ret(self_guard(BPF_CORE_READ(d, d_inode), d, SELF_NO_MOUNT,
@@ -383,6 +427,7 @@ SEC("lsm/move_mount")
 long BPF_PROG(wax_self_move_mount, const struct path *from_path,
               const struct path *to_path)
 {
+    /* Destination only, and judged by itself for the same reason as sb_mount. */
     struct dentry *d = BPF_CORE_READ(to_path, dentry);
 
     return lsm_ret(self_guard(BPF_CORE_READ(d, d_inode), d, SELF_NO_MOUNT,

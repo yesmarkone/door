@@ -1,7 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0 OR MIT
 // The self-defense object: libwdoors.lsm, the third of three (f=file, n=net,
 // s=self). It protects wdog, Agent, their BPF objects and the state they depend
-// on, and it does nothing else — there is no policy here, no user, no rule.
+// on — there is no policy here, no rule, and nothing here decides anything about
+// a user.
+//
+// It does make ONE observation about users, and the exception is stated rather
+// than hidden. The session identity map is already this object's business: it is
+// the one map the guard deliberately lets an outsider open, and wax_self_bpf_map
+// already reports every such open. Pairing that open with the bpf(2) command
+// that follows it (wax_self_bpf, self_session_record) turns "someone opened the
+// identity map" into "session 42 logged in" — a login and logout event nothing
+// else in the system is placed to see. That is an observation, not a decision:
+// SOP_LOGIN and SOP_LOGOUT sit outside the self-defense op range on purpose, so
+// unlike everything else this object emits, Agent's --event-filter CAN hide
+// them. See door/self_const.h and the note in door/self_event.h.
 //
 // ---------------------------------------------------------------------------
 // WHY THIS IS A SEPARATE OBJECT AND NOT PART OF door/file.c

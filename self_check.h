@@ -139,16 +139,109 @@ static __always_inline long self_deny(__u8 op, __u8 kind, __u32 dev, __u64 ino,
     return enforcing ? -1 /* EPERM */ : 0;
 }
 
-/* Does this operation modify anything?
+/* Turn "someone wrote the session identity map" into "session 4242 logged in".
+ *
+ * The pairing is the whole trick. lsm/bpf_map identifies the MAP but never sees
+ * the command — it fires inside bpf_map_new_fd(), which BPF_OBJ_GET and
+ * BPF_MAP_GET_FD_BY_ID both funnel through. lsm/bpf sees the COMMAND but cannot
+ * resolve attr.map_fd to a map, because an fd is a number in the caller's table
+ * and this kernel has no helper to walk it. Each half is useless alone.
+ * wax_self_pin_opens carries the first answer to where the second one is known.
+ *
+ * attr.key is a USERSPACE pointer to the key pam_wood.so is about to write or
+ * delete: a u32 audit session id (pam/pam.c). attr itself is kernel memory —
+ * security_bpf() runs after __sys_bpf() has copied it, which is why the
+ * BPF_LINK_CREATE branch below can read attr->link_create at all — but what it
+ * POINTS AT is still the caller's, hence bpf_probe_read_user.
+ *
+ * That read can fail, and a failure is not a reason to go quiet: the write is
+ * happening either way. The event goes out with SDET_SESSION_UNSET, which is
+ * what tells userspace that target is not a session id rather than session zero.
+ *
+ * DELIBERATELY NOT READING attr.value. It points at struct session_identity,
+ * which already has four mirrors (door/file_types.h, door/net_types.h,
+ * pam/pam.c, cmd/wdog/session.go). A fifth one here — in the object with the
+ * least verifier headroom in the system — to learn a name that wdog reads out of
+ * the map a millisecond later is not a trade worth making. What it costs is
+ * written up at resolveLogin (cmd/wdog/self.go) and in docs/self-defense.md. */
+static __always_inline void self_session_record(int cmd, union bpf_attr *attr)
+{
+    __u64 tid = bpf_get_current_pid_tgid();
+    struct self_pin_open *o;
+    struct task_struct *task;
+    __u64 at, uptr;
+    __u32 recorded = 0, writer;
+    __u8 detail = SDET_SESSION_UNSET;
+
+    o = bpf_map_lookup_elem(&wax_self_pin_opens, &tid);
+    if (!o) return; /* this thread holds no session-map fd; not our business */
+    at = o->at_ns;
+    /* Copy first, delete second. The pointer survives the delete on this kernel,
+     * but "survives" is not something to build a read on. */
+    bpf_map_delete_elem(&wax_self_pin_opens, &tid);
+    if (bpf_ktime_get_ns() - at > SELF_PIN_OPEN_NS) return;
+
+    uptr = BPF_CORE_READ(attr, key);
+    if (uptr && bpf_probe_read_user(&recorded, sizeof(recorded),
+                                    (const void *)uptr) == 0)
+        detail = SDET_SESSION_OK;
+
+    /* session_id on the event is the WRITER's session, filled for free by
+     * emit_self_event; target is the session being RECORDED. pam_wood.so runs
+     * after pam_loginuid.so, so on a real login the two are equal by
+     * construction. When they differ, what just happened is `bpftool map update`
+     * or an attacker writing an identity into somebody else's session — not a
+     * login — and it gets a second, UNSUPPRESSIBLE line: SOP_BPF_MAP is
+     * self-defense, so Agent's --event-filter cannot hide it, while the
+     * observational line below can be filtered away like any other event. */
+    task = (struct task_struct *)bpf_get_current_task_btf();
+    writer = BPF_CORE_READ(task, sessionid);
+    if (detail != SDET_SESSION_OK || recorded != writer) {
+        /* SKIND_SESSION, not SKIND_PIN: target here is the session being written,
+         * where every other SOP_BPF_MAP line carries a map id. The kind is what
+         * keeps the two apart when userspace renders them. */
+        emit_self_event(SOP_BPF_MAP, SKIND_SESSION, 'W', 0, 0, recorded, detail);
+        emit_self_event(cmd == BPF_MAP_UPDATE_ELEM ? SOP_LOGIN : SOP_LOGOUT,
+                        SKIND_SESSION, 'W', 0, 0, recorded, detail);
+        return;
+    }
+    /* 'S', not a status of its own. Nothing was allowed or refused here, but the
+     * letter set stays three; op= is what separates a login from a policy
+     * allow, and docs/build.md says so where the filter fields are listed. */
+    emit_self_event(cmd == BPF_MAP_UPDATE_ELEM ? SOP_LOGIN : SOP_LOGOUT,
+                    SKIND_SESSION, 'S', 0, 0, recorded, detail);
+}
+
+/* Should a miss on the object itself fall through to the ancestor walk?
  *
  * Every file-side caller passes a compile-time constant, so clang folds this
  * away entirely at each call site. That is what makes the read path free: the
  * `check(file, OP_READ)`-equivalent branch of wax_self_open does not merely
  * skip the walk at runtime, the walk is not in the program. Reading a protected
- * binary is not a way around anything, so nothing is lost by it. */
-static __always_inline int self_op_writes(__u32 want)
+ * binary is not a way around anything, so nothing is lost by it.
+ *
+ * SELF_NO_MOUNT IS DELIBERATELY NOT HERE, and it used to be. The walk asks "is
+ * this somewhere inside a protected directory", which is the right question for
+ * creating and deleting — the object being judged does not exist yet, or its
+ * parent is what confers the protection. It is the wrong question for mounting.
+ *
+ * A mount is judged on its mount point, and every ancestor of every protected
+ * object is already published with SELF_NO_MOUNT in its own right (see the
+ * ancestor loop in cmd/wdog/self.go). So `mount --bind /tmp/evil /usr/sbin` is
+ * caught by the plain lookup on /usr/sbin, and so is the same over /run, over
+ * /run/wax, or over the binary itself. The walk added exactly one thing on top
+ * of that: it denied mounting anything *underneath* a protected directory, all
+ * the way to the filesystem root.
+ *
+ * That was not a stricter version of the same control, it was a different and
+ * wrong one. /run/wax makes /run an ancestor, so systemd-user-runtime-dir was
+ * denied the per-user tmpfs on /run/user/<uid> at every login — the directory
+ * got created, the mount did not happen, and XDG_RUNTIME_DIR silently became a
+ * plain directory on the shared /run. The same walk reached / from any mount
+ * point on the root filesystem. */
+static __always_inline int self_ancestor_applies(__u32 want)
 {
-    return (want & (SELF_NO_WRITE | SELF_NO_UNLINK | SELF_NO_MOUNT)) != 0;
+    return (want & (SELF_NO_WRITE | SELF_NO_UNLINK)) != 0;
 }
 
 struct self_tree_ctx {
@@ -232,7 +325,7 @@ static __always_inline long self_guard(struct inode *inode,
     v = self_ino(inode);
     if (v && (v->flags & want)) {
         kind = v->kind;
-    } else if (!self_op_writes(want) ||
+    } else if (!self_ancestor_applies(want) ||
                !self_ancestor(dentry, want, &kind)) {
         return 0;
     }
@@ -270,7 +363,7 @@ static __always_inline long self_guard_parent(struct dentry *pd, __u32 want,
     if (!v || !(v->flags & SELF_IS_DIR) || !(v->flags & want)) {
         __u8 kind = SKIND_ANY;
 
-        if (!self_op_writes(want) || !self_ancestor(pd, want, &kind)) return 0;
+        if (!self_ancestor_applies(want) || !self_ancestor(pd, want, &kind)) return 0;
         if (self_trusted()) return 0;
         return self_deny(op, kind, 0, 0, 0, 0);
     }

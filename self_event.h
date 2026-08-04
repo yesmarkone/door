@@ -24,7 +24,14 @@ static __always_inline void zero_self_event(struct self_event *e)
  * and warnNoEventHidesWarn (cmd/wdog/main.go) exists to catch the one
  * combination where that suppression makes a rule neither deny nor report.
  * This layer has no such combination available to it: silence is not a state it
- * can be in. Agent's --event-filter is bypassed for the same reason. */
+ * can be in. Agent's --event-filter is bypassed for the same reason.
+ *
+ * With ONE exception, and it is worth knowing before reading the paragraph above
+ * as an absolute. SOP_LOGIN and SOP_LOGOUT ride this same ring but are not
+ * self-defense — they observe rather than refuse — so they fall outside
+ * model.Operation.IsSelfDefense() and the filter CAN hide them. Everything on
+ * this ring that denied something is still unsuppressible, including the
+ * SOP_BPF_MAP line self_session_record raises when a login looks forged. */
 static __always_inline void emit_self_event(__u8 op, __u8 kind, __u8 status,
                                             __u32 dev, __u64 ino, __u32 target,
                                             __u8 detail)

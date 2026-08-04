@@ -97,11 +97,15 @@ struct self_event {
     __u32 pid;          /* 28 */
     __u32 ppid;         /* 32 */
     __u32 session_id;   /* 36 */
-    __u32 target;       /* 40 — kill/ptrace tgid, bpf cmd, or lockdown reason */
+    __u32 target;       /* 40 — kill/ptrace tgid, bpf cmd, lockdown reason, or
+                         *      on SOP_LOGIN/SOP_LOGOUT the session being
+                         *      recorded, which is NOT session_id above: that one
+                         *      is the session of the task doing the writing, and
+                         *      the two differing is the forgery signal */
     __u8  op;           /* 44 — SOP_* */
-    __u8  status;       /* 45 — 'F' denied, 'W' would have denied */
+    __u8  status;       /* 45 — 'F' denied, 'W' would have denied, 'S' observed */
     __u8  kind;         /* 46 — SKIND_* */
-    __u8  detail;       /* 47 — signal number, ptrace mode, or fmode */
+    __u8  detail;       /* 47 — signal number, ptrace mode, fmode, or SDET_* */
     char  comm[16];     /* 48 */
 };
 _Static_assert(sizeof(struct self_event) == 64,
@@ -110,5 +114,19 @@ _Static_assert(__builtin_offsetof(struct self_event, op) == 44,
                "self_event.op must stay at offset 44 (cmd/wdog/self_test.go)");
 _Static_assert(__builtin_offsetof(struct self_event, comm) == 48,
                "self_event.comm must stay at offset 48 (cmd/wdog/self_test.go)");
+
+/* One fd handed out for the session identity map, remembered until the very next
+ * bpf(2) command from the same thread names what it was for. See
+ * self_session_record() in door/self_check.h.
+ *
+ * at_ns exists because "the next command" has to mean the next command in this
+ * PAM callback, not the next one this thread ever makes. */
+struct self_pin_open {
+    __u64 at_ns;  /*  0 — bpf_ktime_get_ns() when the fd was handed out */
+    __u32 map_id; /*  8 — which map it was; a decoy pin has a different one */
+    __u32 _pad;   /* 12 */
+};
+_Static_assert(sizeof(struct self_pin_open) == 16,
+               "self_pin_open must stay 16 bytes");
 
 #endif /* DOOR_SELF_TYPES_H */

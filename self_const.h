@@ -68,6 +68,11 @@
 #define SKIND_LOGINUID   14
 #define SKIND_LOCKDOWN   15
 #define SKIND_ANCESTOR   16
+/* 17 AND 18 ARE TAKEN. cmd/wdog/self.go continues this list with two kinds the
+ * loader assigns and the kernel only echoes back — selfKindUnsealKey and
+ * selfKindCgroup. A SKIND_ here at 17 would not collide at build time and would
+ * render as "unseal-key" in every line that carried it. Hence 19. */
+#define SKIND_SESSION    19
 
 /* Operation codes. door/file_const.h owns 1..18 and door/net_const.h owns
  * 20..26; starting at 40 leaves room for either to grow without colliding. */
@@ -85,6 +90,33 @@
 #define SOP_LOGINUID 51
 #define SOP_RDEV     52
 #define SOP_LOCKDOWN 53
+
+/* Session audit, and deliberately NOT in the 40s.
+ *
+ * Everything above is a denial: something was refused, or would have been. These
+ * two are observations — a login happened, a logout happened — and the whole
+ * point of the code choice is that they fall outside
+ * model.Operation.IsSelfDefense() (internal/model/model.go), which is what makes
+ * Agent's --event-filter able to hide them. A self-defense event must never be
+ * hideable; a login event is ordinary audit and should be.
+ *
+ * 27..39 is the gap door/net_const.h left after 26, kept free on purpose so an
+ * unknown code from an older object stands out. These two take the first of it. */
+#define SOP_LOGIN  30
+#define SOP_LOGOUT 31
+
+/* How long an fd handed out by wax_self_bpf_map stays eligible to be paired with
+ * the map command that follows it. pam_wood.so issues BPF_OBJ_GET and then the
+ * update or delete back to back — microseconds apart, in one PAM callback. A
+ * second is three orders of magnitude of slack, and anything older is a
+ * different sequence that must not be labelled a login. */
+#define SELF_PIN_OPEN_NS 1000000000ULL
+
+/* self_event.detail on SOP_LOGIN / SOP_LOGOUT. The distinction matters: without
+ * it, "the key could not be read" and "the key was session 0" arrive as the same
+ * record, and the first must not be reported as a session id. */
+#define SDET_SESSION_OK    0
+#define SDET_SESSION_UNSET 1
 
 /* From the kernel UAPI, not from vmlinux.h — BTF carries types, not macros, so
  * these have to be spelled out here. Both are stable ABI. */

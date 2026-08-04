@@ -64,6 +64,29 @@ struct {
     __type(value, struct self_config);
 } wax_self_config SEC(".maps");
 
+/* thread -> the session-map fd it was just handed. Set by wax_self_bpf_map,
+ * consumed by wax_self_bpf on the next map command, which is what turns "someone
+ * opened the identity map" into "session 42 logged in".
+ *
+ * THIS IS THE FIRST MAP HERE WHOSE ENTRIES AN UNTRUSTED CALLER CAN CAUSE TO
+ * EXIST, so the header comment above no longer holds for all of them, and the
+ * type is LRU for exactly that reason. A HASH returns -E2BIG once full, so
+ * anyone able to open the pin 1024 times without issuing a command would blind
+ * login detection for the whole host. LRU evicts the oldest instead: the worst
+ * an attacker achieves is losing their own detection. Entries are also deleted
+ * on consumption, so in normal operation the live set is around zero and an
+ * eviction is itself abnormal.
+ *
+ * Keyed on bpf_get_current_pid_tgid() — the THREAD, not the tgid. "The syscall I
+ * am about to make" is a per-thread fact, and a tgid key would let two threads
+ * of a multi-threaded opener pair each other's opens with each other's commands. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u64); /* bpf_get_current_pid_tgid() */
+    __type(value, struct self_pin_open);
+} wax_self_pin_opens SEC(".maps");
+
 /* Smaller than wax_events (1<<24) because these records are 64 bytes rather
  * than 1440, and because a host producing enough of them to fill 1MB is a host
  * where the first hundred already said everything. */
