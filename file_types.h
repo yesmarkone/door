@@ -53,23 +53,44 @@ struct rule {
      * padding byte on the same terms warn took the one before it, so no field
      * moved and the size below still did not change. */
     __u8 no_event_fw;
+    /* Which session origins this rule covers: a mask of ORIGIN_BIT(ORIGIN_*),
+     * or 0 for "any origin". Zero is what every rule written before this axis
+     * existed encodes to, which is what keeps their meaning bit for bit
+     * unchanged.
+     *
+     * A mask rather than a single value so one rule can name "remote or
+     * console" — the two human origins — without being written twice. It is a
+     * plain scalar AND in the rule loop for the same reason employee_id is an
+     * interned id: the session lookup that produces the value to test against
+     * happens ONCE per check, outside the loop. See current_session_axes().
+     *
+     * This byte is what the assert below predicted: struct rule had no padding
+     * left, so it cost four and the map's value size with it. That growth is
+     * the ABI signal working — a wdog carrying this axis cannot silently apply
+     * policy to an object that predates it. See checkObjectABI in
+     * cmd/wdog/file.go. */
+    __u8 origin_mask;
+    __u8 _pad[3];
 };
 
 /* The userspace loader writes this by byte offset (cmd/wdog/file.go) and
  * file_test.go pins the size, so a silent layout change here would apply policy
  * to the wrong fields rather than fail to build. */
-_Static_assert(sizeof(struct rule) == 588, "struct rule must stay 588 bytes");
+_Static_assert(sizeof(struct rule) == 592, "struct rule must stay 592 bytes");
 /* sizeof alone cannot catch two adjacent __u8s swapping places, and deny,
  * no_event_s, warn and no_event_fw are four indistinguishable bytes whose
- * meanings are not interchangeable. Pin the two added last.
+ * meanings are not interchangeable. Pin the ones added last.
  *
- * no_event_fw is worth pinning for a second reason: it consumed the struct's
- * last padding byte, so the next flag added here grows struct rule to 592 and
- * therefore the map's value size, which the loader's Put rejects outright. */
+ * origin_mask is the flag no_event_fw's note predicted: it grew the struct from
+ * 588 to 592 and therefore the map's value size, which the loader's Put rejects
+ * outright against an older object. Three padding bytes came back with it, so
+ * the next flag added here is free again. */
 _Static_assert(__builtin_offsetof(struct rule, warn) == 586,
                "rule.warn must stay at offset 586 (cmd/wdog/file.go)");
 _Static_assert(__builtin_offsetof(struct rule, no_event_fw) == 587,
                "rule.no_event_fw must stay at offset 587 (cmd/wdog/file.go)");
+_Static_assert(__builtin_offsetof(struct rule, origin_mask) == 588,
+               "rule.origin_mask must stay at offset 588 (cmd/wdog/file.go)");
 
 /* A signal rule. Deliberately not struct rule: the thing being acted on is
  * another process, so the constraints describe a task rather than a path.
@@ -104,18 +125,29 @@ struct proc_rule {
     __u8 ptrace_mode;               /* 603 — OP_PTRACE only; 0 = any mode */
     __u8 warn;                      /* 604 — this rule alone is observe-only */
     __u8 no_event_fw;               /* 605 — PROC_OP_* mask: ops with no 'F'/'W' */
-    __u8 _pad[2];                   /* 606 */
+    /* ORIGIN_BIT masks, 0 for "any origin". Two of them because this struct is
+     * the one with a target axis: the sender's session origin and the target's
+     * are independent questions, and "a scheduled job may not signal a remote
+     * user's process" needs both halves. See struct rule::origin_mask. */
+    __u8 origin_mask;               /* 606 — sender's session */
+    __u8 target_origin_mask;        /* 607 — target's session */
 };                                  /* 608 */
 
 /* The two bytes came out of the tail padding, so the process controls did not
  * move a single field of the file rule they were modelled on. warn later came
- * out of the same padding, on the same terms, and no_event_fw after it —
- * this struct is the one that still has room to spare. */
+ * out of the same padding, on the same terms, and no_event_fw after it — and
+ * the two origin masks have now spent what was left. The struct is exactly
+ * full at the same size it has always had, so unlike struct rule it crossed
+ * this axis without touching its map's value size. */
 _Static_assert(sizeof(struct proc_rule) == 608, "struct proc_rule must stay 608 bytes");
 _Static_assert(__builtin_offsetof(struct proc_rule, warn) == 604,
                "proc_rule.warn must stay at offset 604 (cmd/wdog/file.go)");
 _Static_assert(__builtin_offsetof(struct proc_rule, no_event_fw) == 605,
                "proc_rule.no_event_fw must stay at offset 605 (cmd/wdog/file.go)");
+_Static_assert(__builtin_offsetof(struct proc_rule, origin_mask) == 606,
+               "proc_rule.origin_mask must stay at offset 606 (cmd/wdog/file.go)");
+_Static_assert(__builtin_offsetof(struct proc_rule, target_origin_mask) == 607,
+               "proc_rule.target_origin_mask must stay at offset 607 (cmd/wdog/file.go)");
 
 /* A credential-switch rule: the task changing its OWN user or group identity,
  * which is what su and sudo do once they are running.
@@ -157,7 +189,15 @@ struct cred_rule {
     __u8 exec_suffix_len;           /* 306 */
     __u8 warn;                      /* 307 — this rule alone is observe-only */
     __u8 no_event_fw;               /* 308 — CRED_OP_* mask: ops with no 'F'/'W' */
-    __u8 _pad[3];                   /* 309 */
+    /* ORIGIN_BIT mask, 0 for "any origin". See struct rule::origin_mask.
+     *
+     * Read this one twice before writing a rule with it. The login descent is
+     * judged here — sshd and crond setuid down to the user AFTER pam_loginuid
+     * has given them that user's session — so an origin-scoped deny in credRules
+     * locks out exactly the kind of login it names. docs/rules-process.md carries
+     * the warning in full. */
+    __u8 origin_mask;               /* 309 */
+    __u8 _pad[2];                   /* 310 */
 };                                  /* 312 */
 
 /* warn took what had been the last padding byte, and no_event_fw is the field
@@ -175,6 +215,8 @@ _Static_assert(__builtin_offsetof(struct cred_rule, warn) == 307,
                "cred_rule.warn must stay at offset 307 (cmd/wdog/file.go)");
 _Static_assert(__builtin_offsetof(struct cred_rule, no_event_fw) == 308,
                "cred_rule.no_event_fw must stay at offset 308 (cmd/wdog/file.go)");
+_Static_assert(__builtin_offsetof(struct cred_rule, origin_mask) == 309,
+               "cred_rule.origin_mask must stay at offset 309 (cmd/wdog/file.go)");
 
 /* Slot 0 of every inner policy map. warning makes the whole policy
  * observe-only: its deny rules are allowed through and reported 'W' instead of
@@ -265,26 +307,63 @@ struct pid_image {
  * a fixed-size block of bytes — junk after the terminator would look up nothing
  * at all. pam_wood.c memsets the value before filling it for this reason.
  *
- * _pad stays although login_time_ns could have taken half of it. It keeps the
- * C layout free of implicit holes, which is what lets cmd/wdog/session.go's
- * mirror be copied whole rather than field by field. */
+ * origin is the third user axis and the only one the kernel reads from the
+ * three fields added last. It took what had been _pad, so login_time_ns did not
+ * move and the offset assert below is the one that was already there. See
+ * ORIGIN_* in door/file_const.h for what it is and why it lives on the session
+ * rather than on the process.
+ *
+ * service and rhost are the raw PAM_SERVICE and PAM_RHOST, recorded whatever
+ * origin was decided — including when it was decided to be ORIGIN_UNKNOWN.
+ * NOTHING IN THE KERNEL READS THEM. They exist so an operator reading an audit
+ * line can see what the module actually saw, which is what turns "why is this
+ * session unknown" from a guess into a lookup: a site-local PAM service the
+ * built-in table has never heard of shows up by name, and the remedy is an
+ * origin= option in that stack. rhost carries what sshd put there — normally
+ * the client address, a hostname where UseDNS is on — and is empty for every
+ * local origin. Both are NUL-terminated and zero-padded, on the same terms as
+ * employee_name, though neither is a hash key.
+ *
+ * Their cost is real and worth stating: this value went 80 -> 176 bytes, and at
+ * max_entries 65536 the preallocated map went 5.2MB -> 11.5MB. See
+ * door/file_maps.h. */
 struct session_identity {
-    char employee_name[EMPLOYEE_NAME_LEN];
-    __u32 login_uid;
-    __u32 _pad;
-    __u64 login_time_ns;
-};
+    char employee_name[EMPLOYEE_NAME_LEN];  /*   0 */
+    __u32 login_uid;                        /*  64 */
+    __u32 origin;                           /*  68 — ORIGIN_*, was _pad */
+    __u64 login_time_ns;                    /*  72 */
+    char service[SESSION_SERVICE_LEN];      /*  80 — PAM_SERVICE, reporting only */
+    char rhost[SESSION_RHOST_LEN];          /* 112 — PAM_RHOST, reporting only */
+};                                          /* 176 */
 
 /* This value crosses three build systems — this object, door/net.c, and
  * pam/pam.c, which is compiled separately and gets no word from the kernel when
  * it is wrong (BPF_MAP_UPDATE_ELEM copies map->value_size bytes from wherever
  * the module points, whatever the module thinks the size is). The asserts are
- * what catches a mirror drifting; see cmd/wdog/session.go for the fourth. */
-_Static_assert(sizeof(struct session_identity) == 80,
+ * what catches a mirror drifting; see cmd/wdog/session.go for the fourth.
+ *
+ * That copy is why growing this struct is a DEPLOYMENT hazard and not merely an
+ * ABI one, and the direction that hurts is the counter-intuitive one. A stale
+ * 80-byte pam_wood.so writing into a freshly pinned 176-byte map makes the
+ * kernel read 96 bytes past the module's stack object and store them where an
+ * operator can read them back. The reverse — a new module, an old map — merely
+ * fails. So the module and the daemons ship as one unit; see pam/pam.c and the
+ * upgrade note in docs/deploy.md. */
+_Static_assert(sizeof(struct session_identity) == 176,
                "session_identity is the pinned wax_session_identity value; its size is an "
                "interface with pam/pam.c and cmd/wdog/session.go");
 _Static_assert(__builtin_offsetof(struct session_identity, login_time_ns) == 72,
                "session_identity.login_time_ns must stay at offset 72 (pam/pam.c)");
+/* origin took _pad, which is exactly why the offset above did not have to move.
+ * Pin it: a field inserted ahead of it would keep the size at 176 by taking
+ * room from service or rhost and silently repoint the one field here the kernel
+ * matches on. */
+_Static_assert(__builtin_offsetof(struct session_identity, origin) == 68,
+               "session_identity.origin must stay at offset 68 (pam/pam.c)");
+_Static_assert(__builtin_offsetof(struct session_identity, service) == 80,
+               "session_identity.service must stay at offset 80 (pam/pam.c)");
+_Static_assert(__builtin_offsetof(struct session_identity, rhost) == 112,
+               "session_identity.rhost must stay at offset 112 (pam/pam.c)");
 
 /* Key of the intern table: a name, padded to a fixed width so it can be hashed.
  * Deliberately the same layout as session_identity's leading field, so a

@@ -18,7 +18,7 @@
 //   lsm_ret()                                       door.c:863-879
 //   path_match_ctx, match_path_cb, match_suffix_cb  door.c:204-263
 //   pattern_is_empty/_is_suffix/match_path_pattern  door.c:269-305
-//   struct session_identity, struct employee_name_key, current_employee_id()
+//   struct session_identity, struct employee_name_key, current_session_axes()
 //   the wax_session_identity and wax_employee_ids maps (SHARED via their pins, not
 //   merely duplicated — the declarations must stay byte-identical)
 //   task_is_exempt()                                door.c:591-596

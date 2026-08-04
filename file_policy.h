@@ -10,7 +10,7 @@ struct policy_check_ctx {
     const char *executable_path;
     const char *policy_id;
     /* The caller's interned employee id, EMPLOYEE_ID_ANY when unknown.
-     * Resolved once per check rather than per rule; see current_employee_id. */
+     * Resolved once per check rather than per rule; see current_session_axes. */
     __u32 employee_id;
     __u32 uid;
     __u32 count;
@@ -25,6 +25,11 @@ struct policy_check_ctx {
     __u8 perm_mask;
     __u8 matched;
     __u8 exec_resolved; /* current process image was resolved via bpf_d_path */
+    /* ORIGIN_BIT of the caller's session, from the same lookup and on the same
+     * terms as employee_id above. Exactly one bit is set, always — an
+     * unclassifiable session carries ORIGIN_BIT(ORIGIN_UNKNOWN) rather than
+     * zero, so the test in check_rule_cb needs no special case for it. */
+    __u8 origin_bit;
     /* The deciding policy's observe-only flag; see struct policy_meta. Read
      * once from the meta slot the caller already resolved, so unlike the
      * runtime config it cannot be missing at decision time. */
@@ -58,6 +63,11 @@ static long check_rule_cb(__u32 i, void *data)
      * caller has EMPLOYEE_ID_ANY, so a rule scoped to anyone cannot match it. */
     if (r->employee_id != EMPLOYEE_ID_ANY && r->employee_id != ctx->employee_id)
         return 0;
+    /* The third user axis, and the cheapest of the three: one AND against a
+     * mask both sides already hold. A rule constraining no origin carries 0 and
+     * skips out on the first test, which is what every rule written before this
+     * axis existed does. */
+    if (r->origin_mask && !(r->origin_mask & ctx->origin_bit)) return 0;
     if (ctx->executable_path) {
         if (ctx->exec_resolved) {
             if (!match_path_pattern(r->exec_path, r->exec_wild,
@@ -132,7 +142,8 @@ static __always_inline int task_is_exempt(void)
  * one uid, many people — controllable per person. */
 static __always_inline int check_policy(const char *path, __u32 path_len, __u8 op)
 {
-    __u32 uid, zero = 0, count, exec_path_len = 0;
+    __u32 uid, zero = 0, count, exec_path_len = 0, employee_id;
+    __u8 origin_bit;
     struct task_struct *task;
     struct policy_slot *meta;
     struct policy_check_ctx ctx;
@@ -185,6 +196,7 @@ static __always_inline int check_policy(const char *path, __u32 path_len, __u8 o
         }
     }
 
+    current_session_axes(task, uid, &employee_id, &origin_bit);
     ctx = (struct policy_check_ctx){
         .inner = inner,
         .path = path,
@@ -192,9 +204,12 @@ static __always_inline int check_policy(const char *path, __u32 path_len, __u8 o
         .policy_id = meta->meta.id,
         .warning = meta->meta.warning,
         /* Two hash lookups per check, next to the bpf_d_path above that costs
-         * considerably more. Policies with no name-scoped rules still pay them,
-         * but never consult the result. */
-        .employee_id = current_employee_id(task, uid),
+         * considerably more. Policies with no name-scoped or origin-scoped
+         * rules still pay them, but never consult the result. Note that adding
+         * the origin axis added no lookup: both axes come out of the one
+         * session record the employee lookup was already fetching. */
+        .employee_id = employee_id,
+        .origin_bit = origin_bit,
         .uid = uid,
         .count = count,
         .path_len = path_len,

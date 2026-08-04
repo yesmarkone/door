@@ -120,13 +120,26 @@ struct {
  * seconds apart to collect a dead one, and pam_wood.c returns PAM_SUCCESS when
  * the update fails — so roughly four thousand logins used to leave every
  * subsequent session unidentified, with every employeeName-scoped rule quietly
- * ceasing to match and nothing in the log but a PAM warning. At 80 bytes an
- * entry this costs about 5.2MB and moves that threshold out of reach.
+ * ceasing to match and nothing in the log but a PAM warning. At 176 bytes an
+ * entry this costs about 11.5MB and moves that threshold out of reach.
  *
- * Changing max_entries changes the pinned map's shape, so checkPin
- * (cmd/wdog/session.go) refuses to start against a pin left by an older build.
- * That refusal is correct and its message already carries the remedy; see the
- * upgrade note in docs/deploy.md. */
+ * That 11.5MB was 5.2MB before the session origin axis added service and rhost
+ * to the record (80 -> 176 bytes), and the whole of it is preallocated: this is
+ * a plain hash without BPF_F_NO_PREALLOC, so the cost is paid at load whether
+ * anyone is logged in or not. Both figures count values only; `bpftool map show`
+ * reports 16.2MB of memlock for this map, the rest being the bucket array and
+ * per-element overhead. It is the price of the two strings, which nothing
+ * matches on and which exist to make an audit line answer "what did PAM
+ * actually see" — see struct session_identity. Halving max_entries would buy it
+ * back and give up the security bound above; the bound is worth more.
+ *
+ * Changing max_entries — or the value size, which the origin axis did — changes
+ * the pinned map's shape, so checkPin (cmd/wdog/session.go) refuses to start
+ * against a pin left by an older build. That refusal is correct and its message
+ * already carries the remedy; see the upgrade note in docs/deploy.md. Note what
+ * that remedy costs here: removing the pin discards the records of sessions
+ * that are still logged in, and they read as ORIGIN_UNKNOWN with no employee
+ * until their next login. */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 65536);

@@ -50,6 +50,11 @@ struct proc_check_ctx {
     __u8 ptrace_mode;           /* OP_PTRACE: masked to PTRACE_MODE_MASK */
     __u8 matched;
     __u8 warning;               /* see struct policy_check_ctx::warning */
+    /* ORIGIN_BITs of the two sessions, resolved once per check like the two
+     * employee ids beside them. The target's costs a second session lookup —
+     * but so did target_employee_id already, and this rides on it. */
+    __u8 origin_bit;            /* sender's session */
+    __u8 target_origin_bit;     /* target's session */
     int result;
 };
 
@@ -93,6 +98,11 @@ static long check_proc_rule_cb(__u32 i, void *data)
     if (r->target_employee_id != EMPLOYEE_ID_ANY &&
         r->target_employee_id != ctx->target_employee_id)
         return 0;
+    /* Both origin axes, sender then target. Either mask being 0 means that side
+     * is unconstrained; see struct rule::origin_mask. */
+    if (r->origin_mask && !(r->origin_mask & ctx->origin_bit)) return 0;
+    if (r->target_origin_mask && !(r->target_origin_mask & ctx->target_origin_bit))
+        return 0;
     if (r->has_target_uid && r->target_uid != ctx->target_uid) return 0;
 
     if (!pattern_is_empty(r->exec_path, r->exec_wild)) {
@@ -134,7 +144,8 @@ static __always_inline int check_proc_policy(struct task_struct *p, __u8 op,
                                              __u8 op_bit, __u32 sig,
                                              __u8 ptrace_mode)
 {
-    __u32 uid, zero = 0, count;
+    __u32 uid, zero = 0, count, employee_id, target_eid;
+    __u8 origin_bit, target_origin_bit;
     struct task_struct *task;
     struct proc_policy_slot *meta;
     struct proc_check_ctx ctx;
@@ -154,6 +165,8 @@ static __always_inline int check_proc_policy(struct task_struct *p, __u8 op,
 
     self_img = task_image(task);
     target_img = task_image(p);
+    current_session_axes(task, uid, &employee_id, &origin_bit);
+    target_session_axes(p, &target_eid, &target_origin_bit);
     ctx = (struct proc_check_ctx){
         .inner = inner,
         .policy_id = meta->meta.id,
@@ -163,8 +176,10 @@ static __always_inline int check_proc_policy(struct task_struct *p, __u8 op,
         .exec_path_len = self_img ? self_img->path_len : 0,
         .target_path_len = target_img ? target_img->path_len : 0,
         .uid = uid,
-        .employee_id = current_employee_id(task, uid),
-        .target_employee_id = target_employee_id(p),
+        .employee_id = employee_id,
+        .target_employee_id = target_eid,
+        .origin_bit = origin_bit,
+        .target_origin_bit = target_origin_bit,
         .target_uid = BPF_CORE_READ(p, cred, uid.val),
         .count = count,
         .sig = sig,

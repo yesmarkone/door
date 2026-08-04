@@ -35,6 +35,9 @@ struct net_check_ctx {
      * once from the meta slot the caller already resolved, so unlike the
      * runtime config it cannot be missing at decision time. */
     __u8 warning;
+    /* ORIGIN_BIT of the caller's session, from the same lookup as employee_id
+     * above. See struct policy_check_ctx::origin_bit in door/file_policy.h. */
+    __u8 origin_bit;
     int result;
 };
 
@@ -66,6 +69,7 @@ static long check_net_rule_cb(__u32 i, void *data)
     /* Scalars only, on purpose: see struct rule::employee_id in door.c. */
     if (r->employee_id != EMPLOYEE_ID_ANY && r->employee_id != ctx->employee_id)
         return 0;
+    if (r->origin_mask && !(r->origin_mask & ctx->origin_bit)) return 0;
     if (r->family && r->family != t->family) return 0;
     if (r->sock_type && r->sock_type != t->sock_type) return 0;
     if (r->protocol && r->protocol != t->protocol) return 0;
@@ -142,7 +146,8 @@ static __always_inline int task_is_exempt(void)
 static __always_inline int check_net_policy(const struct net_target *t, __u8 op,
                                             __u8 perm_bit)
 {
-    __u32 uid, zero = 0, count, exec_path_len = 0;
+    __u32 uid, zero = 0, count, exec_path_len = 0, employee_id;
+    __u8 origin_bit;
     struct task_struct *task;
     struct net_policy_slot *meta;
     struct net_check_ctx ctx;
@@ -183,6 +188,7 @@ static __always_inline int check_net_policy(const struct net_target *t, __u8 op,
         }
     }
 
+    current_session_axes(task, uid, &employee_id, &origin_bit);
     ctx = (struct net_check_ctx){
         .inner = inner,
         .t = t,
@@ -190,9 +196,11 @@ static __always_inline int check_net_policy(const struct net_target *t, __u8 op,
         .policy_id = meta->meta.id,
         .warning = meta->meta.warning,
         /* Two hash lookups per check, next to the bpf_d_path above that costs
-         * considerably more. Policies with no name-scoped rules still pay them,
-         * but never consult the result. */
-        .employee_id = current_employee_id(task, uid),
+         * considerably more. Policies with no name-scoped or origin-scoped
+         * rules still pay them, but never consult the result. The origin axis
+         * added no lookup: it comes out of the record already being fetched. */
+        .employee_id = employee_id,
+        .origin_bit = origin_bit,
         .uid = uid,
         .count = count,
         .exec_path_len = exec_path_len,

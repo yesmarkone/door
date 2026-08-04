@@ -9,7 +9,24 @@
 #define CMDLINE_LEN 512
 #define POLICY_ID_LEN 40
 #define EMPLOYEE_NAME_LEN 64
+/* Reporting-only strings on the session record; this object never reads them
+ * and declares them only so its copy of the struct has the right size. See
+ * door/file_const.h. */
+#define SESSION_SERVICE_LEN 32
+#define SESSION_RHOST_LEN   64
 #define EMPLOYEE_ID_ANY 0
+/* Where the login session came from. Copied from door/file_const.h, which
+ * carries the reasoning; the two objects share no header, only the layouts and
+ * the id spaces they both describe — the same terms struct session_identity is
+ * duplicated on. The values are an interface with pam/pam.c and with every
+ * rule the loader encodes, so the two copies must agree. */
+#define ORIGIN_UNKNOWN   0u
+#define ORIGIN_REMOTE    1u
+#define ORIGIN_CONSOLE   2u
+#define ORIGIN_SCHEDULED 3u
+#define ORIGIN_SERVICE   4u
+#define ORIGIN_MAX       ORIGIN_SERVICE
+#define ORIGIN_BIT(x) ((__u8)(1u << (x)))
 #define MAX_RULES 512
 /* Slot 0 of an inner policy map holds the metadata, so a rule always sits at
  * 1 + its position in the config array and slot 0 can never name one — which is

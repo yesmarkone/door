@@ -132,23 +132,28 @@ static __always_inline int match_addr_prefix(const __u8 *rule, __u8 prefix_len,
     return 1;
 }
 
-/* Copied from door.c: session -> name -> interned id, resolved once per check.
- * See there for why every break in that chain yields EMPLOYEE_ID_ANY rather
- * than failing closed, and why none of this may happen per rule. */
-static __always_inline __u32 current_employee_id(struct task_struct *task,
-                                                 __u32 login_uid)
+/* Copied from door.c: one record, one lookup, two axes — session -> name ->
+ * interned id, and session -> origin — resolved once per check. See there for
+ * why every break in either chain yields EMPLOYEE_ID_ANY and ORIGIN_UNKNOWN
+ * rather than failing closed, and why none of this may happen per rule. */
+static __always_inline void current_session_axes(struct task_struct *task,
+                                                 __u32 login_uid,
+                                                 __u32 *employee_id,
+                                                 __u8 *origin_bit)
 {
     __u32 sid = BPF_CORE_READ(task, sessionid);
     struct session_identity *si;
     __u32 *id;
 
-    if (sid == (__u32)-1) return EMPLOYEE_ID_ANY;
+    *employee_id = EMPLOYEE_ID_ANY;
+    *origin_bit = ORIGIN_BIT(ORIGIN_UNKNOWN);
+    if (sid == (__u32)-1) return;
     si = bpf_map_lookup_elem(&wax_session_identity, &sid);
-    if (!si) return EMPLOYEE_ID_ANY;
-    if (si->login_uid != login_uid) return EMPLOYEE_ID_ANY;
+    if (!si) return;
+    if (si->login_uid != login_uid) return;
+    if (si->origin <= ORIGIN_MAX) *origin_bit = ORIGIN_BIT(si->origin);
     id = bpf_map_lookup_elem(&wax_employee_ids, si->employee_name);
-    if (!id) return EMPLOYEE_ID_ANY;
-    return *id;
+    if (id) *employee_id = *id;
 }
 
 #endif /* DOOR_NET_MATCH_H */

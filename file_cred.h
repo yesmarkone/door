@@ -101,6 +101,14 @@ struct cred_check_ctx {
     __u8 setid_flags;           /* LSM_SETID_*, for the event only */
     __u8 matched;
     __u8 warning;               /* see struct policy_check_ctx::warning */
+    /* ORIGIN_BIT of the switching task's session; see struct
+     * policy_check_ctx::origin_bit. Note WHOSE session this is on a login
+     * descent: sshd and crond have already been given the arriving user's
+     * session by pam_loginuid when they setuid down to them, so the origin here
+     * is the one the arriving login will have. That is what makes an
+     * origin-scoped credRule able to stop a login of that kind — and what makes
+     * a careless one lock it out. */
+    __u8 origin_bit;
     int result;
 };
 
@@ -133,6 +141,7 @@ static long check_cred_rule_cb(__u32 i, void *data)
     if (!delta_pick(ctx->delta, constrained, want, &from_id, &to_id)) return 0;
     if (r->employee_id != EMPLOYEE_ID_ANY && r->employee_id != ctx->employee_id)
         return 0;
+    if (r->origin_mask && !(r->origin_mask & ctx->origin_bit)) return 0;
 
     if (!pattern_is_empty(r->exec_path, r->exec_wild)) {
         if (!ctx->exec_path) return 0;
@@ -166,7 +175,8 @@ static __always_inline int check_cred_policy(const struct cred *new_cred,
                                              const struct cred *old_cred,
                                              __u8 op, __u8 op_bit, int flags)
 {
-    __u32 uid, zero = 0, count;
+    __u32 uid, zero = 0, count, employee_id;
+    __u8 origin_bit;
     __u32 new_ids[CRED_ID_SLOTS], old_ids[CRED_ID_SLOTS];
     struct cred_id_delta delta;
     struct task_struct *task;
@@ -215,6 +225,7 @@ static __always_inline int check_cred_policy(const struct cred *new_cred,
     if (count == 0) return 0;
 
     self_img = task_image(task);
+    current_session_axes(task, uid, &employee_id, &origin_bit);
     ctx = (struct cred_check_ctx){
         .inner = inner,
         .policy_id = meta->meta.id,
@@ -223,7 +234,8 @@ static __always_inline int check_cred_policy(const struct cred *new_cred,
         .delta = &delta,
         .exec_path_len = self_img ? self_img->path_len : 0,
         .uid = uid,
-        .employee_id = current_employee_id(task, uid),
+        .employee_id = employee_id,
+        .origin_bit = origin_bit,
         .count = count,
         .op = op,
         .op_bit = op_bit,

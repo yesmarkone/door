@@ -14,6 +14,31 @@
 // belong to whatever policy happens to be installed and change on nobody's
 // schedule but wdog's.
 //
+// It records a second thing for the same reason — because it is the only code
+// on the host in a position to know it. A child of sshd is a remote user's
+// process and a child of crond is the system's, and NOTHING downstream can tell
+// them apart: /etc/pam.d/crond runs pam_loginuid too, so a cron job carries a
+// real audit session id and the target user's login uid exactly as an ssh login
+// does. The kernel sees two tasks that agree on every field it has. PAM is
+// where the difference still exists, in PAM_SERVICE and PAM_RHOST, and this
+// module is loaded into sshd on one login and crond on the next. So it
+// classifies the session's origin once, here, and writes it beside the name.
+//
+// That makes origin a property of the SESSION, not of the process, which is the
+// whole point: every descendant inherits it through task->sessionid without
+// anything having to walk a process tree. Ancestry rots — a process survives
+// its login through setsid or nohup, a shell under tmux is not a child of sshd
+// at all — and an audit session id does not. It also rides through su and sudo
+// untouched, for the same reason the login uid does: neither runs
+// pam_loginuid, so neither opens a new session.
+//
+// The stacks that most need this are the ones with nobody to name, so recording
+// the origin must not require an identity. See `origin_only`:
+//
+//     # /etc/pam.d/crond, /etc/pam.d/atd
+//     session    required   pam_loginuid.so
+//     session    optional   pam_wood.so origin=scheduled origin_only
+//
 // Deliberately no libbpf. All this needs is three bpf(2) commands, and the
 // module is loaded into sshd's address space on every login — a dependency on
 // libbpf (and through it zlib and elfutils) is a liability there, and it would
@@ -68,6 +93,19 @@
  * the value layout of a map those two objects declare, and the kernel would
  * reject an update of the wrong size. */
 #define EMPLOYEE_NAME_LEN 64
+/* Must equal SESSION_SERVICE_LEN and SESSION_RHOST_LEN in door/file_const.h,
+ * for the same reason. */
+#define SESSION_SERVICE_LEN 32
+#define SESSION_RHOST_LEN   64
+
+/* Must equal the ORIGIN_* codes in door/file_const.h. This module is the ONLY
+ * writer of this field: nothing else on the host is in a position to know. See
+ * classify_origin() below for how each is decided. */
+#define ORIGIN_UNKNOWN   0u
+#define ORIGIN_REMOTE    1u
+#define ORIGIN_CONSOLE   2u
+#define ORIGIN_SCHEDULED 3u
+#define ORIGIN_SERVICE   4u
 
 #define DEFAULT_MAP_PATH "/sys/fs/bpf/wax/wax_session_identity"
 #define DEFAULT_ENV_NAME "PAM_EMPLOYEE_NAME"
@@ -78,20 +116,42 @@
  * wdog, to stamp its audit lines with when the session logged in; zero means
  * "not recorded" and wdog approximates it from /proc instead.
  *
+ * origin says where the session came from — remote, console, scheduled, service
+ * — and is the one field added with it that the kernel matches on. service and
+ * rhost are the raw PAM items it was decided from, recorded for the audit line
+ * and read by nothing.
+ *
+ * This module is where the origin axis is decided because this module is the
+ * only code in the system that is in a position to decide it. It is loaded into
+ * sshd's address space on one login and crond's on the next, and PAM hands it
+ * the service name and the remote host of whichever it is. A child of sshd and
+ * a child of crond are otherwise indistinguishable — same login uid, same audit
+ * session id, both with a PAM session — so everything downstream depends on
+ * this being recorded here and recorded correctly.
+ *
  * The size is an interface, and an unusually unforgiving one: BPF_MAP_UPDATE_ELEM
  * carries no value size, so the kernel copies map->value_size bytes from the
  * address below whatever this module believes that struct is. A module built
- * against an older layout therefore hands a newer map eight bytes of this
- * function's stack with no error anywhere. Hence the assert, and hence the rule
- * that this module ships with the daemons rather than on its own schedule. */
+ * against an older layout therefore hands a newer map the difference in bytes
+ * of this function's stack, with no error anywhere — and since this struct grew
+ * 80 -> 176 for the origin axis, that difference is now 96 bytes of stack
+ * readable by anyone who can dump the map. Hence the assert, and hence the rule
+ * that this module ships with the daemons rather than on its own schedule:
+ * `make && make pam-install` and a daemon restart are one operation. */
 struct session_identity {
-	char employee_name[EMPLOYEE_NAME_LEN];
-	uint32_t login_uid;
-	uint32_t _pad;
-	uint64_t login_time_ns;
+	char employee_name[EMPLOYEE_NAME_LEN];	/*   0 */
+	uint32_t login_uid;			/*  64 */
+	uint32_t origin;			/*  68 — ORIGIN_* */
+	uint64_t login_time_ns;			/*  72 */
+	char service[SESSION_SERVICE_LEN];	/*  80 — PAM_SERVICE */
+	char rhost[SESSION_RHOST_LEN];		/* 112 — PAM_RHOST, empty if local */
 };
 
-_Static_assert(sizeof(struct session_identity) == 80,
+_Static_assert(sizeof(struct session_identity) == 176,
+	       "must match struct session_identity in door/file_types.h");
+_Static_assert(__builtin_offsetof(struct session_identity, origin) == 68,
+	       "must match struct session_identity in door/file_types.h");
+_Static_assert(__builtin_offsetof(struct session_identity, login_time_ns) == 72,
 	       "must match struct session_identity in door/file_types.h");
 
 struct options {
@@ -115,7 +175,168 @@ struct options {
 	 * On a host where those rules are the control, `strict` turns that silent
 	 * fail-open into a refused login, which is loud and recoverable. */
 	int strict;
+	/* origin overrides what classify_origin() would infer, and is how a stack
+	 * the built-in table has never heard of gets classified: `origin=scheduled`
+	 * in a site-local batch runner's stack. ORIGIN_UNKNOWN here means "no
+	 * override given", which is why it cannot itself be selected by name — a
+	 * stack that wants a session left unclassified simply omits the module. */
+	uint32_t origin;
+	/* The raw origin= argument, kept only so a name that matched nothing can
+	 * be named back at the operator. Without it a typo is indistinguishable
+	 * from no option at all — the stack would look configured and quietly
+	 * classify nothing. */
+	const char *origin_arg;
+	/* origin_only makes the identity OPTIONAL rather than absent: the session
+	 * is never refused for want of a name — not by the check below, not by
+	 * `strict` — and a stack carrying it records what it has.
+	 *
+	 * This exists because the stacks that most need the origin axis are exactly
+	 * the ones with nobody to name. A cron job has no person behind it, so the
+	 * module's usual demand ("say who this is or the login is refused") is not
+	 * a safety property there but an outage: dropping this module into
+	 * /etc/pam.d/crond without this option stops every cron job on the host.
+	 *
+	 * It relaxes the requirement and NOTHING else. A name that is there is
+	 * still recorded, which matters more than it looks: the GDM setup in
+	 * docs/employee-pam.md puts this module in /etc/pam.d/systemd-user
+	 * precisely so that session gets a name, and that stack also wants
+	 * origin=service. Discarding a name here would quietly undo it. So the two
+	 * compose — `origin=service origin_only fallback=user` names the session
+	 * when PAM can and stays silent when it cannot.
+	 *
+	 * When no name is available the record carries an empty employee_name,
+	 * which resolves in the kernel exactly as an unrecorded session does —
+	 * EMPLOYEE_ID_ANY, so only rules naming nobody apply. The employee axis is
+	 * therefore unchanged in both meaning and effect; the only thing gained is
+	 * the origin. */
+	int origin_only;
 };
+
+/* Names for the origin= option. ORIGIN_UNKNOWN is deliberately absent: the
+ * option's job is to state an answer, and "unknown" is what its absence already
+ * means. */
+static const struct { const char *name; uint32_t origin; } origin_names[] = {
+	{ "remote",    ORIGIN_REMOTE },
+	{ "console",   ORIGIN_CONSOLE },
+	{ "scheduled", ORIGIN_SCHEDULED },
+	{ "service",   ORIGIN_SERVICE },
+};
+
+/* PAM service name -> origin, consulted when no origin= option was given.
+ *
+ * A fallback, not the mechanism. These are the /etc/pam.d/ file names RHEL 9
+ * ships, and a distro is free to rename them or a site to invent its own — so a
+ * miss here is expected and costs only ORIGIN_UNKNOWN, never a wrong answer.
+ * The remedy for a miss is an origin= option in that stack, and the way an
+ * operator finds out they need one is service= on the audit line naming
+ * something this table does not list.
+ *
+ * su and sudo are absent on purpose, and their absence is not an oversight:
+ * neither runs pam_loginuid, so neither opens an audit session, so this module
+ * has nothing to key on and is not installed in those stacks. A session's
+ * origin survives su and sudo untouched, exactly as its login uid does. */
+static const struct { const char *service; uint32_t origin; } origin_table[] = {
+	{ "sshd",           ORIGIN_REMOTE },
+	/* THE ENTRY MOST WORTH UNDERSTANDING. "remote" is util-linux login(1)'s
+	 * service name when it is started with -h, which is what in.telnetd (and
+	 * rlogind) does — telnet-server ships no PAM stack of its own and delegates
+	 * the whole login to /bin/login. So a telnet login reads /etc/pam.d/remote
+	 * and never touches /etc/pam.d/login.
+	 *
+	 * That split is the reason this table can tell a telnet session from a
+	 * console one at all: the same binary serves both, and the ONLY thing that
+	 * distinguishes them here is which of its two service names it started PAM
+	 * with. Putting the module in /etc/pam.d/login and expecting telnet to be
+	 * covered is the mistake this entry exists to make survivable — it isn't
+	 * covered, and without this entry a telnet session that somehow lost its
+	 * PAM_RHOST would fall through to ORIGIN_UNKNOWN rather than to console. */
+	{ "remote",         ORIGIN_REMOTE },
+	/* FTP daemons. "vsftpd" is what RHEL's /etc/vsftpd/vsftpd.conf sets
+	 * pam_service_name to; "ftp" is vsftpd's own compiled-in default, so a host
+	 * that never edited that line lands there instead. Both are listed because
+	 * which one applies is a config question, not a distro question.
+	 *
+	 * Listing them changes nothing unless vsftpd is also built and configured to
+	 * open a PAM session — session_support defaults to NO, and with it off
+	 * vsftpd never calls pam_open_session, so no session module runs at all.
+	 * See docs/rules-session-origin.md; that is a bigger problem than the origin
+	 * axis, because pam_loginuid.so is a session module too. */
+	{ "vsftpd",         ORIGIN_REMOTE },
+	{ "ftp",            ORIGIN_REMOTE },
+	{ "proftpd",        ORIGIN_REMOTE },
+	{ "pure-ftpd",      ORIGIN_REMOTE },
+	/* login(1) WITHOUT -h: the local console. See the "remote" note above for
+	 * why these two are the same program and must not be the same origin. */
+	{ "login",          ORIGIN_CONSOLE },
+	{ "gdm-password",   ORIGIN_CONSOLE },
+	{ "gdm-autologin",  ORIGIN_CONSOLE },
+	{ "gdm-launch-environment", ORIGIN_CONSOLE },
+	{ "lightdm",        ORIGIN_CONSOLE },
+	{ "xdm",            ORIGIN_CONSOLE },
+	{ "crond",          ORIGIN_SCHEDULED },
+	{ "atd",            ORIGIN_SCHEDULED },
+	{ "systemd-user",   ORIGIN_SERVICE },
+	{ "runuser",        ORIGIN_SERVICE },
+	{ "runuser-l",      ORIGIN_SERVICE },
+};
+
+/* Where this session came from, decided in four steps and in this order:
+ *
+ *   1. the origin= option, which an operator wrote in this very stack and which
+ *      therefore outranks anything this module could infer;
+ *   2. the built-in table above, keyed on PAM_SERVICE;
+ *   3. a non-empty PAM_RHOST, which means somebody reached this host over a
+ *      network whatever the service is called;
+ *   4. ORIGIN_UNKNOWN.
+ *
+ * Step 3 is last among the inferences rather than first because it is the
+ * weaker signal of the two: a service in the table is a definite statement about
+ * what kind of thing this is, while rhost only says the connection came from
+ * somewhere else. They agree on sshd, and where they could disagree the named
+ * service is what an operator would expect to win.
+ *
+ * Nothing here can fail. An unset PAM item, a service name nobody has heard of,
+ * a truncated rhost — every one of them lands on ORIGIN_UNKNOWN, which the
+ * kernel side treats as "matches only rules that constrain no origin". Failing
+ * to a value that constrains nothing is the same direction the employee axis
+ * fails in, and for the same reason: a login this module cannot classify must
+ * not become a login that silently trips every origin-scoped deny rule on the
+ * host. */
+static uint32_t classify_origin(const struct options *o, const char *service,
+				const char *rhost)
+{
+	if (o->origin != ORIGIN_UNKNOWN)
+		return o->origin;
+	if (service && *service) {
+		for (size_t i = 0; i < sizeof(origin_table) / sizeof(origin_table[0]); i++)
+			if (!strcmp(service, origin_table[i].service))
+				return origin_table[i].origin;
+	}
+	if (rhost && *rhost)
+		return ORIGIN_REMOTE;
+	return ORIGIN_UNKNOWN;
+}
+
+static const char *origin_str(uint32_t origin)
+{
+	for (size_t i = 0; i < sizeof(origin_names) / sizeof(origin_names[0]); i++)
+		if (origin_names[i].origin == origin)
+			return origin_names[i].name;
+	return "unknown";
+}
+
+/* A PAM item as a string, never NULL. pam_get_item leaves the pointer untouched
+ * on failure and can also hand back a NULL for an item that was simply never
+ * set, so both are folded into the empty string here — the callers treat "not
+ * set" and "set to nothing" identically. */
+static const char *item_str(pam_handle_t *pamh, int item)
+{
+	const void *v = NULL;
+
+	if (pam_get_item(pamh, item, &v) != PAM_SUCCESS || !v)
+		return "";
+	return (const char *)v;
+}
 
 static void parse_options(struct options *o, int argc, const char **argv)
 {
@@ -124,6 +345,9 @@ static void parse_options(struct options *o, int argc, const char **argv)
 	o->debug = 0;
 	o->fallback_user = 0;
 	o->strict = 0;
+	o->origin = ORIGIN_UNKNOWN;
+	o->origin_arg = NULL;
+	o->origin_only = 0;
 	for (int i = 0; i < argc; i++) {
 		if (!strncmp(argv[i], "map=", 4))
 			o->map_path = argv[i] + 4;
@@ -135,6 +359,20 @@ static void parse_options(struct options *o, int argc, const char **argv)
 			o->fallback_user = 1;
 		else if (!strcmp(argv[i], "strict"))
 			o->strict = 1;
+		else if (!strcmp(argv[i], "origin_only"))
+			o->origin_only = 1;
+		else if (!strncmp(argv[i], "origin=", 7)) {
+			/* An unrecognised name leaves o->origin at ORIGIN_UNKNOWN,
+			 * so classify_origin falls through to the table and the
+			 * session is still classified as well as it can be. The
+			 * typo is reported at open_session, which has a pam handle
+			 * to report it through; origin_arg is what survives to
+			 * there to be named. */
+			o->origin_arg = argv[i] + 7;
+			for (size_t j = 0; j < sizeof(origin_names) / sizeof(origin_names[0]); j++)
+				if (!strcmp(o->origin_arg, origin_names[j].name))
+					o->origin = origin_names[j].origin;
+		}
 	}
 }
 
@@ -212,13 +450,25 @@ int pam_sm_open_session(pam_handle_t *pamh, int flags, int argc, const char **ar
 	struct options o;
 	struct session_identity id;
 	union bpf_attr attr;
-	const char *name;
+	const char *name, *service, *rhost;
+	uint32_t origin;
 	long sid, uid;
 	uint32_t key;
 	int fd;
 
 	(void)flags;
 	parse_options(&o, argc, argv);
+
+	service = item_str(pamh, PAM_SERVICE);
+	rhost = item_str(pamh, PAM_RHOST);
+	origin = classify_origin(&o, service, rhost);
+	/* A name that matched nothing. Worth LOG_ERR rather than a debug line: the
+	 * stack LOOKS configured, and the only other symptom is origin-scoped rules
+	 * quietly not matching a session an operator believes they classified. */
+	if (o.origin_arg && o.origin == ORIGIN_UNKNOWN)
+		pam_syslog(pamh, LOG_ERR,
+			   "origin=%s names no known origin (remote, console, scheduled, service); falling back to the service name",
+			   o.origin_arg);
 
 	name = pam_getenv(pamh, o.env_name);
 	if ((!name || !*name) && o.fallback_user) {
@@ -227,7 +477,10 @@ int pam_sm_open_session(pam_handle_t *pamh, int flags, int argc, const char **ar
 		if (pam_get_item(pamh, PAM_USER, (const void **)&user) == PAM_SUCCESS)
 			name = user;
 	}
-	if (!name || !*name) {
+	/* origin_only makes the name optional, so a missing one is not a failure
+	 * here — it is the expected state on a crond or atd stack. A name that IS
+	 * present still gets recorded below; see struct options::origin_only. */
+	if ((!name || !*name) && !o.origin_only) {
 		/* Nobody said who this is, so refuse the session: an account reached
 		 * this way would run entirely outside the per-person policy, which is
 		 * the whole reason the module is installed. LOG_ERR unconditionally,
@@ -235,7 +488,7 @@ int pam_sm_open_session(pam_handle_t *pamh, int flags, int argc, const char **ar
 		 * turned away, and with `optional` it is a stack that silently records
 		 * nobody. Both need to be visible without turning debug on. */
 		pam_syslog(pamh, LOG_ERR,
-			   "%s is unset; refusing the session (the module that sets it must run before pam_wood.so; use `optional` here to let such logins through unidentified)",
+			   "%s is unset; refusing the session (the module that sets it must run before pam_wood.so; use `optional` here to let such logins through unidentified, or `origin_only` in a stack with nobody to name, such as crond)",
 			   o.env_name);
 		/* Best effort: sshd relays this to the client on most builds, and where
 		 * it does not, the syslog line above is what remains. Deliberately says
@@ -265,7 +518,11 @@ int pam_sm_open_session(pam_handle_t *pamh, int flags, int argc, const char **ar
 		 * from here the two are indistinguishable. `strict` is what lets a host
 		 * refuse to guess. */
 		pam_syslog(pamh, LOG_WARNING, "opening %s: %m (is wdog running?)", o.map_path);
-		if (o.strict) {
+		/* origin_only never refuses. A stack carrying it has nobody to
+		 * identify, so there is no identity requirement for `strict` to
+		 * enforce — and refusing here would stop cron on a host where the only
+		 * thing wrong is that wdog is not running. */
+		if (o.strict && !o.origin_only) {
 			pam_error(pamh, "Login denied: this account requires an identified user.");
 			return PAM_SESSION_ERR;
 		}
@@ -277,13 +534,26 @@ int pam_sm_open_session(pam_handle_t *pamh, int flags, int argc, const char **ar
 	 * rules carry, and a hash key is compared as a block of bytes. Anything left
 	 * after the terminator would hash to something no rule knows, and the login
 	 * would silently go unidentified. strncpy pads to its bound for the same
-	 * reason. */
+	 * reason.
+	 *
+	 * It also zero-fills service and rhost, which matters for a second reason:
+	 * this struct is 176 bytes of stack that the kernel copies WHOLE, so any
+	 * byte left unwritten here is a byte of this function's frame published
+	 * into a map. */
 	memset(&id, 0, sizeof(id));
-	/* One byte short of the field, so the name is always NUL-terminated. A
-	 * longer name is truncated here and simply will not equal any rule — the
-	 * loader rejects rules above the same bound, so the two agree. */
-	strncpy(id.employee_name, name, EMPLOYEE_NAME_LEN - 1);
+	/* One byte short of each field, so every string is always NUL-terminated. A
+	 * longer employee name is truncated here and simply will not equal any rule
+	 * — the loader rejects rules above the same bound, so the two agree. A
+	 * truncated service or rhost only shortens a log line; nothing matches on
+	 * them. Under origin_only name may be absent entirely, which leaves the
+	 * memset's zeros in place — an empty name, resolving as an unidentified
+	 * session does. */
+	if (name && *name)
+		strncpy(id.employee_name, name, EMPLOYEE_NAME_LEN - 1);
+	strncpy(id.service, service, SESSION_SERVICE_LEN - 1);
+	strncpy(id.rhost, rhost, SESSION_RHOST_LEN - 1);
 	id.login_uid = (uint32_t)uid;
+	id.origin = origin;
 	id.login_time_ns = now_realtime_ns();
 	key = (uint32_t)sid;
 
@@ -302,14 +572,16 @@ int pam_sm_open_session(pam_handle_t *pamh, int flags, int argc, const char **ar
 				   o.map_path);
 		else
 			pam_syslog(pamh, LOG_INFO, "recording session %ld: %m", sid);
-		if (o.strict) {
+		if (o.strict && !o.origin_only) {
 			close(fd);
 			pam_error(pamh, "Login denied: this account requires an identified user.");
 			return PAM_SESSION_ERR;
 		}
 	} else if (o.debug) {
-		pam_syslog(pamh, LOG_INFO, "session %ld (uid %ld) recorded as %s",
-			   sid, uid, id.employee_name);
+		pam_syslog(pamh, LOG_INFO,
+			   "session %ld (uid %ld) recorded as %s, origin %s (service %s, rhost %s)",
+			   sid, uid, id.employee_name, origin_str(id.origin),
+			   id.service, id.rhost);
 	}
 	close(fd);
 	return PAM_SUCCESS;

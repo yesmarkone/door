@@ -162,7 +162,9 @@ static __always_inline long self_deny(__u8 op, __u8 kind, __u32 dev, __u64 ino,
  * which already has four mirrors (door/file_types.h, door/net_types.h,
  * pam/pam.c, cmd/wdog/session.go). A fifth one here — in the object with the
  * least verifier headroom in the system — to learn a name that wdog reads out of
- * the map a millisecond later is not a trade worth making. What it costs is
+ * the map a millisecond later is not a trade worth making. The session origin
+ * axis is the case that proves it: that struct went 80 -> 176 bytes and gained
+ * three fields, and none of the four mirrors' churn reached this file. What it costs is
  * written up at resolveLogin (cmd/wdog/self.go) and in docs/self-defense.md. */
 static __always_inline void self_session_record(int cmd, union bpf_attr *attr)
 {

@@ -11,10 +11,65 @@
  * for a 63-character name plus its NUL. Rules do not store the name — see
  * struct rule::employee_id — but the session record and the intern table do. */
 #define EMPLOYEE_NAME_LEN 64
+/* The two reporting-only strings on the session record. Neither is ever matched
+ * against, in the kernel or out of it — they exist to be printed.
+ *
+ * 32 covers every PAM service name a distro ships with room to spare
+ * ("gdm-autologin" is the longest that comes to mind at 13), and a longer one is
+ * truncated rather than rejected: the classification has already happened by
+ * then and does not depend on this string.
+ *
+ * 64 for rhost holds any IPv6 literal (INET6_ADDRSTRLEN is 46) and the great
+ * majority of hostnames. A hostname longer than 63 characters is truncated, and
+ * it is worth being clear that this is acceptable ONLY because nothing decides
+ * anything from this field — a truncated address that were matched against
+ * would be a security bug, and this one is a log line. */
+#define SESSION_SERVICE_LEN 32
+#define SESSION_RHOST_LEN   64
 /* A rule that constrains no employee, and the id of a session whose employee
  * is unknown. The two meeting is what makes an unidentified session match only
  * the rules that name nobody. */
 #define EMPLOYEE_ID_ANY 0
+
+/* Where a login session came from — the third user axis, after the login uid
+ * that selects the policy and the employee that selects which of its rules
+ * apply. It answers the one question the first two cannot: a child of sshd and
+ * a child of crond carry the SAME login uid and the SAME audit session id, and
+ * under the axes above they are the same thing. They are not.
+ *
+ * This is a property of the login session, not of the process. pam_wood.so
+ * classifies it once at open_session — it runs inside sshd's or crond's address
+ * space, so PAM_SERVICE and PAM_RHOST are right there — and writes it into
+ * session_identity. Every descendant inherits it for free through
+ * task->sessionid, which is why nothing here walks a process tree: ancestry
+ * decays (setsid, nohup past logout, a shell under tmux), and an audit session
+ * id does not. It survives su and sudo for the same reason the login uid does —
+ * neither runs pam_loginuid, so neither opens a new session.
+ *
+ * Tasks with NO PAM session (sessionid == -1: systemd units started by pid 1,
+ * kernel threads) never reach a rule loop at all — task_is_exempt() turns them
+ * away first — so they have no value here. Everything below is a distinction
+ * BETWEEN sessions that exist.
+ *
+ * ORIGIN_UNKNOWN is not a failure to be papered over. A stack that never got
+ * the module, a record lost to a reap, a session opened before wdog started —
+ * all land here, and a rule constraining origin does not match them. That is
+ * the same fail-to-not-match direction current_session_axes() takes for the
+ * employee: "deny what cannot be placed" is written as a rule naming
+ * ORIGIN_UNKNOWN, out loud, rather than happening by omission. */
+#define ORIGIN_UNKNOWN   0u  /* not classified; see above — never silently denied */
+#define ORIGIN_REMOTE    1u  /* a person, over the network. sshd */
+#define ORIGIN_CONSOLE   2u  /* a person, at the machine. login, gdm */
+#define ORIGIN_SCHEDULED 3u  /* no person; a timetable started it. crond, atd */
+#define ORIGIN_SERVICE   4u  /* a session manager. systemd-user */
+#define ORIGIN_MAX       ORIGIN_SERVICE
+
+/* The session record stores one value; a rule stores a MASK of them, so a
+ * single rule can say "remote or console" without being written twice. Zero is
+ * "this rule constrains no origin", which is what every rule predating the axis
+ * carries — that is what keeps an installed policy's meaning bit for bit
+ * unchanged. See struct rule::origin_mask. */
+#define ORIGIN_BIT(x) ((__u8)(1u << (x)))
 /* Converts start_boottime to the units /proc/<pid>/stat reports. USER_HZ is 100
  * in the kernel's /proc ABI regardless of CONFIG_HZ, and fs/proc/array.c derives
  * starttime from the same start_boottime, so dividing here reproduces that field

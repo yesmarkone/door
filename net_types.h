@@ -44,7 +44,16 @@ struct net_rule {
     __u8 no_event_fw;
     __u16 port_min;     /* host byte order, inclusive */
     __u16 port_max;
-};
+    /* Which session origins this rule covers: a mask of ORIGIN_BIT(ORIGIN_*),
+     * or 0 for "any origin". See struct rule::origin_mask in door/file_types.h.
+     *
+     * Appended after port_max rather than squeezed in ahead of it. There was no
+     * padding left to take, so either way the struct grows to 616 — and putting
+     * it last is what keeps port_min and port_max where cmd/wdog/net.go already
+     * writes them. */
+    __u8 origin_mask;   /* 612 */
+    __u8 _pad[3];       /* 613 */
+};                      /* 616 */
 
 /* Slot 0 of every per-uid net policy. warning is door.c's struct policy_meta
  * field, at the same offset and with the same meaning: the whole policy becomes
@@ -62,19 +71,27 @@ _Static_assert(__builtin_offsetof(struct net_policy_meta, warning) == 44,
 
 /* Copied from door.c — the two objects must agree on these layouts byte for
  * byte, because they share the pinned maps holding them. See door.c for the
- * rationale on login_uid and on the zero-padding invariant. */
+ * rationale on login_uid, on origin, and on the zero-padding invariant.
+ *
+ * This object reads origin and nothing else of what was added with it: service
+ * and rhost are declared here purely so the struct has the size the shared map
+ * was created with. */
 struct session_identity {
-    char employee_name[EMPLOYEE_NAME_LEN];
-    __u32 login_uid;
-    __u32 _pad;
-    __u64 login_time_ns;
-};
+    char employee_name[EMPLOYEE_NAME_LEN];  /*   0 */
+    __u32 login_uid;                        /*  64 */
+    __u32 origin;                           /*  68 — ORIGIN_*, was _pad */
+    __u64 login_time_ns;                    /*  72 */
+    char service[SESSION_SERVICE_LEN];      /*  80 — reporting only; unread here */
+    char rhost[SESSION_RHOST_LEN];          /* 112 — reporting only; unread here */
+};                                          /* 176 */
 
-_Static_assert(sizeof(struct session_identity) == 80,
+_Static_assert(sizeof(struct session_identity) == 176,
                "session_identity is the pinned wax_session_identity value; its size is an "
                "interface with pam/pam.c and cmd/wdog/session.go");
 _Static_assert(__builtin_offsetof(struct session_identity, login_time_ns) == 72,
                "session_identity.login_time_ns must stay at offset 72 (pam/pam.c)");
+_Static_assert(__builtin_offsetof(struct session_identity, origin) == 68,
+               "session_identity.origin must stay at offset 68 (pam/pam.c)");
 
 struct employee_name_key {
     char name[EMPLOYEE_NAME_LEN];
@@ -262,15 +279,21 @@ struct net_cgroup_scratch {
 /* The userspace loader writes these two by byte offset (cmd/wdog/net.go) and
  * pins the sizes in net_test.go, so a silent layout change here would corrupt
  * policy and events rather than fail to build. */
-_Static_assert(sizeof(struct net_rule) == 612, "struct net_rule must stay 612 bytes");
+_Static_assert(sizeof(struct net_rule) == 616, "struct net_rule must stay 616 bytes");
 /* sizeof cannot catch two adjacent __u8s swapping places, and deny, no_event_s,
  * warn and no_event_fw are four indistinguishable bytes whose meanings are not
  * interchangeable. Same treatment as door.c's struct rule. no_event_fw took the
- * struct's last padding byte, so the next flag added here moves port_min. */
+ * struct's last padding byte, and origin_mask is what the note there predicted:
+ * it grew the struct 612 -> 616. It went on the END so that port_min and
+ * port_max, which the loader writes by offset, did not move — pin all four. */
 _Static_assert(__builtin_offsetof(struct net_rule, warn) == 606,
                "net_rule.warn must stay at offset 606 (cmd/wdog/net.go)");
 _Static_assert(__builtin_offsetof(struct net_rule, no_event_fw) == 607,
                "net_rule.no_event_fw must stay at offset 607 (cmd/wdog/net.go)");
+_Static_assert(__builtin_offsetof(struct net_rule, port_min) == 608,
+               "net_rule.port_min must stay at offset 608 (cmd/wdog/net.go)");
+_Static_assert(__builtin_offsetof(struct net_rule, origin_mask) == 612,
+               "net_rule.origin_mask must stay at offset 612 (cmd/wdog/net.go)");
 _Static_assert(sizeof(struct net_event) == 1472, "struct net_event must stay 1472 bytes");
 _Static_assert(sizeof(struct net_event) % 8 == 0, "zero_net_event needs a multiple of 8");
 /* rule_slot took over a hole that already existed, which is why the 1472 above
