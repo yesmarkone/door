@@ -151,7 +151,9 @@ static __always_inline void current_session_axes(struct task_struct *task,
     si = bpf_map_lookup_elem(&wax_session_identity, &sid);
     if (!si) return;
     if (si->login_uid != login_uid) return;
-    if (si->origin <= ORIGIN_MAX) *origin_bit = ORIGIN_BIT(si->origin);
+    /* ORIGIN_VALUE, not the raw field: its high bits are flags. See door/file_match.h. */
+    __u32 origin = ORIGIN_VALUE(si->origin);
+    if (origin <= ORIGIN_MAX) *origin_bit = ORIGIN_BIT(origin);
     id = bpf_map_lookup_elem(&wax_employee_ids, si->employee_name);
     if (id) *employee_id = *id;
 }

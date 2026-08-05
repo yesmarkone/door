@@ -27,6 +27,13 @@
 #define ORIGIN_SERVICE   4u
 #define ORIGIN_MAX       ORIGIN_SERVICE
 #define ORIGIN_BIT(x) ((__u8)(1u << (x)))
+/* The origin field's high bits are flags; SESSION_CLOSED marks a session whose
+ * login has ended while its processes live on. Copied from door/file_const.h,
+ * which carries the reasoning, on the same terms as the values above. This
+ * object never branches on the flag — it only has to mask it off before reading
+ * the origin, which ORIGIN_VALUE is for. */
+#define SESSION_CLOSED   (1u << 31)
+#define ORIGIN_VALUE(x)  ((x) & 0xffu)
 #define MAX_RULES 512
 /* Slot 0 of an inner policy map holds the metadata, so a rule always sits at
  * 1 + its position in the config array and slot 0 can never name one — which is

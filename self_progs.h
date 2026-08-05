@@ -150,9 +150,13 @@ long BPF_PROG(wax_self_bpf_prog, struct bpf_prog *prog)
  * LINKS: bpf_link_new_fd() calls anon_inode_getfd() directly — there is no
  * security_bpf_link() in this kernel — so a link fd can only be gated here.
  *
- * And the COMMAND ITSELF, which is what separates a login from a logout: both
- * arrive at wax_self_bpf_map as the identical fd on the identical map, and only
- * BPF_MAP_UPDATE_ELEM versus BPF_MAP_DELETE_ELEM tells them apart. */
+ * And the ATTR, which is what separates a login from a logout: both arrive at
+ * wax_self_bpf_map as the identical fd on the identical map, and nothing there
+ * tells them apart. It used to be the command alone — update versus delete —
+ * but close_session now updates the record to mark it closed rather than
+ * deleting it, so the two commands no longer line up with the two events. The
+ * update flag does; self_session_record() explains why that signal is honest and
+ * why delete is still read as a logout. */
 SEC("lsm/bpf")
 long BPF_PROG(wax_self_bpf, int cmd, union bpf_attr *attr, unsigned int size)
 {

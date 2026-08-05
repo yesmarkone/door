@@ -75,11 +75,15 @@ _Static_assert(__builtin_offsetof(struct net_policy_meta, warning) == 44,
  *
  * This object reads origin and nothing else of what was added with it: service
  * and rhost are declared here purely so the struct has the size the shared map
- * was created with. */
+ * was created with.
+ *
+ * origin's low byte is the origin and its high bits are flags — read it through
+ * ORIGIN_VALUE(). This object never branches on SESSION_CLOSED; it only has to
+ * mask it off, or every session whose login has ended would read as unknown. */
 struct session_identity {
     char employee_name[EMPLOYEE_NAME_LEN];  /*   0 */
     __u32 login_uid;                        /*  64 */
-    __u32 origin;                           /*  68 — ORIGIN_*, was _pad */
+    __u32 origin;                           /*  68 — ORIGIN_* | flags, was _pad */
     __u64 login_time_ns;                    /*  72 */
     char service[SESSION_SERVICE_LEN];      /*  80 — reporting only; unread here */
     char rhost[SESSION_RHOST_LEN];          /* 112 — reporting only; unread here */

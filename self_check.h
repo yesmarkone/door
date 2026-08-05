@@ -165,7 +165,23 @@ static __always_inline long self_deny(__u8 op, __u8 kind, __u32 dev, __u64 ino,
  * the map a millisecond later is not a trade worth making. The session origin
  * axis is the case that proves it: that struct went 80 -> 176 bytes and gained
  * three fields, and none of the four mirrors' churn reached this file. What it costs is
- * written up at resolveLogin (cmd/wdog/self.go) and in docs/self-defense.md. */
+ * written up at resolveLogin (cmd/wdog/self.go) and in docs/self-defense.md.
+ *
+ * WHICH IS WHY LOGOUT IS READ OFF attr.flags AND NOT OUT OF THE RECORD.
+ * close_session no longer deletes the record — it sets SESSION_CLOSED in it and
+ * UPDATES, so that a login whose processes outlive it keeps both user axes
+ * (door/file_const.h). That took away the thing this function used to tell a
+ * login from a logout: the command. The honest signal is one field away, though.
+ * pam_wood.so opens with BPF_ANY, because a reused session id may still hold a
+ * lingering record it must overwrite, and closes with BPF_EXIST, because closing
+ * a session that was never recorded is exactly the case it wants to fail. So the
+ * flag it passes already means "this is a close", and reading it costs ONE scalar
+ * out of attr — kernel memory this function already reads, no user pointer, no
+ * struct layout, no fifth mirror. The rule above stands untouched.
+ *
+ * BPF_MAP_DELETE_ELEM still counts as a logout. That is not vestigial: an older
+ * pam_wood.so deletes, and an operator who upgrades the objects before the module
+ * would otherwise see every logout on the host reported as a login. */
 static __always_inline void self_session_record(int cmd, union bpf_attr *attr)
 {
     __u64 tid = bpf_get_current_pid_tgid();
@@ -174,6 +190,7 @@ static __always_inline void self_session_record(int cmd, union bpf_attr *attr)
     __u64 at, uptr;
     __u32 recorded = 0, writer;
     __u8 detail = SDET_SESSION_UNSET;
+    __u8 op;
 
     o = bpf_map_lookup_elem(&wax_self_pin_opens, &tid);
     if (!o) return; /* this thread holds no session-map fd; not our business */
@@ -187,6 +204,12 @@ static __always_inline void self_session_record(int cmd, union bpf_attr *attr)
     if (uptr && bpf_probe_read_user(&recorded, sizeof(recorded),
                                     (const void *)uptr) == 0)
         detail = SDET_SESSION_OK;
+
+    /* See the note above on why this is attr.flags and not the record. Both reads
+     * are of attr itself, which security_bpf() has already copied into kernel
+     * memory — the same reason the BPF_LINK_CREATE branch can read attr->link_create. */
+    op = (cmd == BPF_MAP_DELETE_ELEM || BPF_CORE_READ(attr, flags) == BPF_EXIST)
+             ? SOP_LOGOUT : SOP_LOGIN;
 
     /* session_id on the event is the WRITER's session, filled for free by
      * emit_self_event; target is the session being RECORDED. pam_wood.so runs
@@ -203,15 +226,13 @@ static __always_inline void self_session_record(int cmd, union bpf_attr *attr)
          * where every other SOP_BPF_MAP line carries a map id. The kind is what
          * keeps the two apart when userspace renders them. */
         emit_self_event(SOP_BPF_MAP, SKIND_SESSION, 'W', 0, 0, recorded, detail);
-        emit_self_event(cmd == BPF_MAP_UPDATE_ELEM ? SOP_LOGIN : SOP_LOGOUT,
-                        SKIND_SESSION, 'W', 0, 0, recorded, detail);
+        emit_self_event(op, SKIND_SESSION, 'W', 0, 0, recorded, detail);
         return;
     }
     /* 'S', not a status of its own. Nothing was allowed or refused here, but the
      * letter set stays three; op= is what separates a login from a policy
      * allow, and docs/build.md says so where the filter fields are listed. */
-    emit_self_event(cmd == BPF_MAP_UPDATE_ELEM ? SOP_LOGIN : SOP_LOGOUT,
-                    SKIND_SESSION, 'S', 0, 0, recorded, detail);
+    emit_self_event(op, SKIND_SESSION, 'S', 0, 0, recorded, detail);
 }
 
 /* Should a miss on the object itself fall through to the ancestor walk?

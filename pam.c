@@ -107,6 +107,13 @@
 #define ORIGIN_SCHEDULED 3u
 #define ORIGIN_SERVICE   4u
 
+/* The origin field's high bits are flags. SESSION_CLOSED is what close_session
+ * sets INSTEAD of deleting the record, so that a login whose processes outlive
+ * it — a remote-IDE server, nohup, tmux, setsid — keeps its employee name and
+ * its origin for as long as those processes run. door/file_const.h carries the
+ * reasoning; this module is the only writer of the bit, as it is of the field. */
+#define SESSION_CLOSED   (1u << 31)
+
 #define DEFAULT_MAP_PATH "/sys/fs/bpf/wax/wax_session_identity"
 #define DEFAULT_ENV_NAME "PAM_EMPLOYEE_NAME"
 
@@ -587,10 +594,35 @@ int pam_sm_open_session(pam_handle_t *pamh, int flags, int argc, const char **ar
 	return PAM_SUCCESS;
 }
 
+/* Mark the session closed. NOT delete it — that distinction is the whole of this
+ * function, and it is worth stating why here rather than only in door/.
+ *
+ * The audit session id outlives the login. A process that was in this session
+ * carries task->sessionid until it exits, whatever happens to sshd, and plenty
+ * of them are DESIGNED to outlive it: a VS Code or JetBrains remote server whose
+ * bootstrap ssh disconnects seconds after launching it, anything under nohup or
+ * setsid, a shell inside tmux or screen. Deleting the record here took both user
+ * axes away from exactly those processes — employee and origin went blank for
+ * the rest of their lives, and rules naming either silently stopped matching the
+ * longest-lived and most interesting work on the host.
+ *
+ * So the record lingers, carrying SESSION_CLOSED, and wdog's reaper removes it
+ * once the session has no live process left (cmd/wdog/session.go). It already
+ * did that for sessions that never reached this function at all; the only change
+ * on that side is that it now stays quiet when the flag says a logout was
+ * already reported.
+ *
+ * BPF_EXIST rather than BPF_ANY, and it is load-bearing twice over. It refuses
+ * to resurrect a record the reaper deleted between the lookup and the update —
+ * the two are not atomic and cannot be — and, because open_session passes
+ * BPF_ANY, the flag is what lets the kernel object tell a close from an open now
+ * that both are BPF_MAP_UPDATE_ELEM. See self_session_record() in
+ * door/self_check.h; without it every logout on the host reports as a login. */
 int pam_sm_close_session(pam_handle_t *pamh, int flags, int argc, const char **argv)
 {
 	struct options o;
 	union bpf_attr attr;
+	struct session_identity id;
 	long sid;
 	uint32_t key;
 	int fd;
@@ -608,12 +640,27 @@ int pam_sm_close_session(pam_handle_t *pamh, int flags, int argc, const char **a
 	memset(&attr, 0, sizeof(attr));
 	attr.map_fd = fd;
 	attr.key = (uint64_t)(unsigned long)&key;
-	/* ENOENT means there was no record — an open_session that found no name,
-	 * or wdog's reaper got there first. Neither is worth a log line. */
-	if (bpf(BPF_MAP_DELETE_ELEM, &attr) < 0 && errno != ENOENT)
-		pam_syslog(pamh, LOG_WARNING, "clearing session %ld: %m", sid);
+	attr.value = (uint64_t)(unsigned long)&id;
+	/* The lookup fills all 176 bytes, so what goes back is what was recorded at
+	 * login with one bit added — no field is rewritten from this frame, and the
+	 * name keeps the zero padding the kernel hashes it on.
+	 *
+	 * ENOENT means there was no record: an open_session that found no name, a
+	 * stack this module is not installed in, or wdog's reaper got there first.
+	 * None is worth a log line. */
+	if (bpf(BPF_MAP_LOOKUP_ELEM, &attr) < 0) {
+		if (errno != ENOENT)
+			pam_syslog(pamh, LOG_WARNING, "reading session %ld: %m", sid);
+		close(fd);
+		return PAM_SUCCESS;
+	}
+	id.origin |= SESSION_CLOSED;
+	attr.flags = BPF_EXIST;
+	if (bpf(BPF_MAP_UPDATE_ELEM, &attr) < 0 && errno != ENOENT)
+		pam_syslog(pamh, LOG_WARNING, "closing session %ld: %m", sid);
 	else if (o.debug)
-		pam_syslog(pamh, LOG_DEBUG, "session %ld cleared", sid);
+		pam_syslog(pamh, LOG_DEBUG,
+			   "session %ld closed; record kept until its last process exits", sid);
 	close(fd);
 	return PAM_SUCCESS;
 }

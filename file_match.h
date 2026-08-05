@@ -164,12 +164,22 @@ static __always_inline void current_session_axes(struct task_struct *task,
      * one of those leftovers and must not lend its name — or its origin — to
      * this task. */
     if (si->login_uid != login_uid) return;
-    /* Bounded before the shift, and not only to keep it defined: origin is
+    /* ORIGIN_VALUE first: the high bits of that field are flags, and SESSION_CLOSED
+     * is set on every session whose login has ended while its processes live on.
+     * Reading the field raw would put all of them on the unknown bit — which is
+     * the exact hole this flag was added to close.
+     *
+     * Bounded before the shift, and not only to keep it defined: origin is
      * written by a separate build (pam/pam.c), so a module newer than this
      * object can name an origin this object has never heard of. Leaving such a
      * session on the unknown bit is the same fail-to-not-match the rest of this
-     * function takes. */
-    if (si->origin <= ORIGIN_MAX) *origin_bit = ORIGIN_BIT(si->origin);
+     * function takes.
+     *
+     * Note what is NOT here: no branch on SESSION_CLOSED. A closed session's
+     * processes match the origin rules they matched while it was open, because
+     * the origin belongs to the session and those processes are still in it. */
+    __u32 origin = ORIGIN_VALUE(si->origin);
+    if (origin <= ORIGIN_MAX) *origin_bit = ORIGIN_BIT(origin);
     /* The name is looked up in place: employee_name_key is exactly the leading
      * field of the record, so no copy to a key buffer is needed. */
     id = bpf_map_lookup_elem(&wax_employee_ids, si->employee_name);

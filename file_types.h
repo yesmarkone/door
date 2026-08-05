@@ -313,6 +313,20 @@ struct pid_image {
  * ORIGIN_* in door/file_const.h for what it is and why it lives on the session
  * rather than on the process.
  *
+ * Its LOW BYTE is the origin; the high bits are flags, and SESSION_CLOSED is the
+ * only one so far. Read it through ORIGIN_VALUE() and never raw. That packing is
+ * deliberate rather than thrifty: a flag in a field of its own would have grown
+ * this struct, and growing it is the deployment hazard written up below — the
+ * pin has to be discarded and every module in lockstep. The spare bits were
+ * already paid for.
+ *
+ * SESSION_CLOSED says pam_wood.so has run close_session while processes still
+ * carry this session id. The record then LINGERS instead of being deleted, and
+ * wdog's reaper removes it once the last of those processes is gone. What that
+ * buys is the case the origin axis was weakest on: a login whose processes
+ * outlive it — a remote-IDE server, nohup, tmux, setsid — used to lose both user
+ * axes at logout and match only rules that constrain neither.
+ *
  * service and rhost are the raw PAM_SERVICE and PAM_RHOST, recorded whatever
  * origin was decided — including when it was decided to be ORIGIN_UNKNOWN.
  * NOTHING IN THE KERNEL READS THEM. They exist so an operator reading an audit

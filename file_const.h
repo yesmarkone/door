@@ -64,6 +64,39 @@
 #define ORIGIN_SERVICE   4u  /* a session manager. systemd-user */
 #define ORIGIN_MAX       ORIGIN_SERVICE
 
+/* session_identity.origin carries the origin in its low byte and flags in its
+ * high bits. The field is a __u32 holding values 0..ORIGIN_MAX, so the room was
+ * already there — which is the whole reason the flag lives here rather than in a
+ * field of its own. Growing the struct is a deployment hazard (see
+ * door/file_types.h): it invalidates the pin, and a pam_wood.so built against
+ * the old layout hands the kernel the difference in bytes of its own stack.
+ * Riding in spare bits costs none of that.
+ *
+ * SESSION_CLOSED means pam_wood.so has run close_session for this session — the
+ * login is over — while at least one process still carries its audit session id.
+ * That state is ordinary rather than exceptional: a VS Code or JetBrains remote
+ * server whose bootstrap ssh exits immediately, anything under nohup, setsid,
+ * tmux or screen past logout. Those processes keep task->sessionid forever, and
+ * before this flag existed the record was DELETED at close_session, so they lost
+ * both user axes — employee and origin — for the rest of their lives. The most
+ * long-lived processes on a host were the ones policy could not place.
+ *
+ * NOTHING IN THE KERNEL BRANCHES ON IT. The origin keeps matching exactly as it
+ * did while the session was open, which is the point: origin is a property of
+ * the session, and the session's processes are still here. The flag exists so an
+ * audit line can say the login behind them has ended, and so wdog's reaper can
+ * tell an ordinary cleanup from a session that never reached close_session at
+ * all (cmd/wdog/session.go, sweep). */
+#define SESSION_CLOSED   (1u << 31)
+/* Extracts the origin from that field. Every reader must go through this: a
+ * record written by a newer pam_wood.so has the flag set, and comparing the raw
+ * field against ORIGIN_MAX would place such a session on the unknown bit. That
+ * is also precisely what an OLDER build does with a newer module's record, and
+ * it is the safe direction — fail to not-match, as everywhere else on this axis
+ * — but it is degraded behaviour, not the intent. Hence the rule that the module
+ * and the daemons ship together; see pam/pam.c. */
+#define ORIGIN_VALUE(x)  ((x) & 0xffu)
+
 /* The session record stores one value; a rule stores a MASK of them, so a
  * single rule can say "remote or console" without being written twice. Zero is
  * "this rule constrains no origin", which is what every rule predating the axis
