@@ -87,89 +87,40 @@ static __always_inline int check_path_op(const struct path *p, __u8 op)
     return check_policy(ps->path, (__u32)len - 1, op);
 }
 
-/*
- * inode_setattr only receives a dentry, so the path is rebuilt by walking
- * d_parent toward the filesystem root, writing components right-to-left.
- * The result lacks the mount prefix for files on non-root mounts; rules are
- * matched against the path as seen from that filesystem's root.
- */
-struct dentry_walk_ctx {
-    struct dentry *d;
-    struct dentry_walk_scratch *s;
-    __u32 pos;
-    __u8 done;
-    __u8 failed;
-};
-
-static long dentry_walk_cb(__u32 i, void *data)
-{
-    struct dentry_walk_ctx *ctx = data;
-    struct dentry *d = ctx->d, *parent;
-    const unsigned char *name;
-    __u32 pos, sz;
-    long len;
-
-    if (!d) {
-        ctx->failed = 1;
-        return 1;
-    }
-    parent = BPF_CORE_READ(d, d_parent);
-    if (parent == d) {
-        ctx->done = 1;
-        return 1;
-    }
-    name = BPF_CORE_READ(d, d_name.name);
-    len = bpf_probe_read_kernel_str(ctx->s->name, PATH_LEN, name);
-    if (len <= 1) {
-        ctx->failed = 1;
-        return 1;
-    }
-    sz = (__u32)len - 1;                        /* component bytes, no NUL */
-    if (sz >= PATH_LEN || ctx->pos < sz + 1) {  /* out of path budget */
-        ctx->failed = 1;
-        return 1;
-    }
-    pos = ctx->pos - (sz + 1);
-    if (pos >= PATH_LEN) {                      /* bound for the verifier */
-        ctx->failed = 1;
-        return 1;
-    }
-    ctx->s->build[pos] = '/';
-    if (bpf_probe_read_kernel(&ctx->s->build[pos + 1], sz, ctx->s->name) < 0) {
-        ctx->failed = 1;
-        return 1;
-    }
-    ctx->pos = pos;
-    ctx->d = parent;
-    return 0;
-}
-
+/* inode_setattr only receives a dentry; the path comes from the d_parent walk
+ * in file_walk.h, with the mount-prefix caveat documented there. */
 static __always_inline int check_dentry_op(struct dentry *dentry, __u8 op)
 {
     __u32 zero = 0;
-    struct dentry_walk_scratch *s;
     struct file_path_scratch *ps;
-    struct dentry_walk_ctx ctx;
     long len;
 
     if (task_is_exempt()) return 0;
-    s = bpf_map_lookup_elem(&wax_dentry_walk_scratch_map, &zero);
     ps = bpf_map_lookup_elem(&wax_file_path_scratch, &zero);
-    if (!s || !ps) return 0;
-    s->build[PATH_LEN] = '\0';
-    ctx = (struct dentry_walk_ctx){ .d = dentry, .s = s, .pos = PATH_LEN };
-    bpf_loop(MAX_DENTRY_DEPTH, dentry_walk_cb, &ctx, 0);
-    /* Allow rather than mis-match on an incomplete (too deep/long) walk. */
-    if (!ctx.done || ctx.failed || ctx.pos > PATH_LEN) return 0;
-    if (ctx.pos == PATH_LEN) {                  /* dentry was the root itself */
-        ps->path[0] = '/';
-        ps->path[1] = '\0';
-        len = 2;
-    } else if ((len = bpf_probe_read_kernel_str(ps->path, PATH_LEN,
-                                                &s->build[ctx.pos])) <= 0) {
-        return 0;
-    }
+    if (!ps) return 0;
+    len = walk_dentry_path(dentry, ps->path, PATH_LEN);
+    if (len <= 0) return 0;
     return check_policy(ps->path, (__u32)len - 1, op);
+}
+
+/* Judge an open file whose path cannot come from bpf_d_path, because the hook
+ * is not a sleepable one. walk_file_path() in file_walk.h explains which hooks
+ * those are and why the mount chain has to be walked rather than the dentry
+ * chain alone; check_policy resolves the process image the same way, which is
+ * what the walk argument selects. */
+static __always_inline int check_file_walk_op(struct file *file, __u8 op,
+                                              __u8 quiet_s)
+{
+    __u32 zero = 0;
+    struct file_path_scratch *ps;
+    long len;
+
+    if (task_is_exempt()) return 0;
+    ps = bpf_map_lookup_elem(&wax_file_path_scratch, &zero);
+    if (!ps) return 0;
+    len = walk_file_path(file, ps->path, PATH_LEN);
+    if (len <= 0) return 0;
+    return check_policy_walk(ps->path, (__u32)len - 1, op, quiet_s);
 }
 
 /*

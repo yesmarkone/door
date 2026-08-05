@@ -17,6 +17,7 @@
 #include "file_match.h"
 #include "file_cgroup.h"
 #include "file_event.h"
+#include "file_walk.h"     /* path resolution only; check_policy needs it */
 #include "file_policy.h"   /* also task_is_exempt() */
 #include "file_path.h"     /* also lsm_ret() */
 #include "file_proc.h"

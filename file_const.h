@@ -153,6 +153,14 @@
  * remainder of the gap before the network codes in net.c. */
 #define OP_RENAME_TO 18
 
+/* Reading the NAMES out of a directory: getdents(2)/getdents64(2), judged at the
+ * security_file_permission() call that opens iterate_dir(). Distinct from
+ * OP_READ, which is still what file_open reports for opendir() — holding a
+ * directory handle and enumerating what is inside it are different acts, and
+ * PERM_LIST below is what tells them apart. 19 is the last of the gap before the
+ * network codes in net.c. */
+#define OP_READDIR 19
+
 /* cred_rule::op_mask bits, the same kind of set proc_rule carries: one rule
  * covers the user switch, the group switch, or both. */
 #define CRED_OP_SETUID_BIT 0x01
@@ -184,6 +192,15 @@
 #define PTRACE_MODE_MASK       0x03
 #define FMODE_READ  0x00000001
 #define FMODE_WRITE 0x00000002
+/* include/linux/fs.h. The mask argument of security_file_permission():
+ * iterate_dir() passes MAY_READ, rw_verify_area() passes MAY_READ or MAY_WRITE. */
+#define MAY_READ  0x00000004
+/* include/linux/stat.h file-type bits. BTF carries types, not macros, which is
+ * why FMODE_READ above is spelled out too. Kept identical to the copy in
+ * door/self_const.h — that object needs S_IFCHR/S_IFBLK as well, this one only
+ * needs to ask "is this a directory". */
+#define S_IFMT  0170000
+#define S_IFDIR 0040000
 /* include/linux/fs.h iattr ia_valid flags */
 #define ATTR_SIZE      (1 << 3)
 #define ATTR_MTIME     (1 << 5)
@@ -203,11 +220,24 @@
  *
  * What PERM_DELETE is NOT is content destruction. truncate(), O_TRUNC and a
  * plain overwrite leave the name in place and stay under PERM_WRITE. A rule
- * that means to keep a file's contents intact needs the write bit. */
+ * that means to keep a file's contents intact needs the write bit.
+ *
+ * PERM_LIST, unlike PERM_DELETE, was NOT carved out of anything. read(2) governs
+ * opening a directory and always did; list(16) governs only what happens on the
+ * fd afterwards, which nothing governed before it existed. No installed rule
+ * changes meaning when a daemon carrying this bit takes over — a read-deny that
+ * stopped opendir() yesterday stops it today. What it does not do, and never
+ * did, is stop a directory fd that was opened before the rule was written, or
+ * one inherited across exec, or one passed over SCM_RIGHTS. That is the gap
+ * list(16) closes, and it is why the loader warns about read-denies that do not
+ * carry it.
+ *
+ * Note that "all bits" is now 31, not 15. */
 #define PERM_EXEC   1
 #define PERM_READ   2
 #define PERM_WRITE  4
 #define PERM_DELETE 8
+#define PERM_LIST   16
 
 /* The one place an operation is mapped to the permission bits that govern it.
  * The result is a mask, not a single bit: a rule matches when it carries any of
@@ -220,6 +250,9 @@ static __always_inline __u8 op_perm_mask(__u8 op)
     switch (op) {
     case OP_EXEC:      return PERM_EXEC;
     case OP_READ:      return PERM_READ;
+    /* Enumeration only. The open that produced the fd was judged as OP_READ
+     * against PERM_READ, and still is; this bit says nothing about it. */
+    case OP_READDIR:   return PERM_LIST;
     /* OP_UNLINK is both unlink(2) and rmdir(2) — they share the op code, so
      * there is no way to write a rule covering one but not the other. */
     case OP_UNLINK:

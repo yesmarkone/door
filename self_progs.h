@@ -281,6 +281,48 @@ long BPF_PROG(wax_self_open, struct file *file, int ret)
     return lsm_ret(self_guard(inode, dentry, SELF_NO_READ, SOP_READ, 0));
 }
 
+/* Listing one of the daemon's own directories: getdents(2)/getdents64(2), judged
+ * where iterate_dir() calls security_file_permission(file, MAY_READ).
+ *
+ * Enumeration is not modification, so this is the one self-defense control that
+ * is about disclosure rather than integrity. It is worth being precise about
+ * what it buys: the pin NAMES are public by construction (they are in
+ * pinnedMapNames, in docs/deploy.md, and in `bpftool map show`), so this is not
+ * secrecy. What it removes is the reconnaissance step — an attacker enumerating
+ * the store directory to learn which files exist before trying to swap one, and
+ * doing it without tripping a single event.
+ *
+ * ORDER MATTERS HERE MORE THAN ANYWHERE ELSE IN THIS OBJECT. self.c attaches
+ * ~45s before the file object and runs on every host, and file_permission is
+ * called on every read() and every write() of every regular file and socket. The
+ * directory test comes first because it is two loads and a compare, then the
+ * config flag, which is an ARRAY lookup and is clear on any host with no
+ * list-guarded entry. Only past both does anything touch the inode hash.
+ *
+ * Unlike the file object's readdir hook this needs no path at all: self-defense
+ * matches on {dev, ino}, which is why bpf_d_path being unavailable at this
+ * attach point (see door/file_walk.h) costs this program nothing. */
+SEC("lsm/file_permission")
+long BPF_PROG(wax_self_readdir, struct file *file, int mask, int ret)
+{
+    struct inode *inode;
+    __u32 imode;
+
+    if (ret) return lsm_ret(ret);
+    inode = BPF_CORE_READ(file, f_inode);
+    if (!inode) return 0;
+    imode = BPF_CORE_READ(inode, i_mode);
+    if ((imode & S_IFMT) != S_IFDIR) return 0;   /* the hot-path early-out */
+    if (!(mask & MAY_READ)) return 0;
+    if (!self_cfg_flag(SCFG_HAVE_LIST_GUARD)) return 0;
+    /* No f_pos gate, unlike the file object's hook. Self-defense denies rather
+     * than reports, and a refusal that only lands on the first getdents of a
+     * pass would not be a refusal. Its event volume is bounded by the deny
+     * itself: the caller does not get a second batch. */
+    return lsm_ret(self_guard(inode, BPF_CORE_READ(file, f_path.dentry),
+                              SELF_NO_LIST, SOP_READDIR, 0));
+}
+
 SEC("lsm/path_unlink")
 long BPF_PROG(wax_self_unlink, const struct path *dir, struct dentry *dentry)
 {

@@ -34,6 +34,11 @@ struct policy_check_ctx {
      * once from the meta slot the caller already resolved, so unlike the
      * runtime config it cannot be missing at decision time. */
     __u8 warning;
+    /* Drop the 'S' for this one check; set from the OP_QUIET_S flag the caller
+     * OR'd into op. Only wax_check_readdir sets it, and only for the second and
+     * later getdents of one enumeration. Deliberately NOT a general mute: 'F'
+     * and 'W' are unaffected, and the verdict is not touched at all. */
+    __u8 quiet_s;
     int result;
 };
 
@@ -41,8 +46,18 @@ struct policy_check_ctx {
  * Keep rule traversal inside bpf_loop rather than a C-bounded loop.  Larger
  * policy limits would otherwise be unrolled by clang and exceed the verifier's
  * instruction limit before the program can load.
+ *
+ * `can_exec` is why this is a body plus two wrappers instead of one callback.
+ * A bpf_loop callback is a real function with its own frame, so ctx->op is a
+ * runtime value inside it and `ctx->op == OP_EXEC` can never fold — which means
+ * the queue_exec_event() call below, and the bpf_d_path() inside it, are part of
+ * every program that runs this loop. In lsm/file_permission that is fatal:
+ * bpf_d_path does not load there at all (see walk_file_path in file_walk.h), and
+ * the program is rejected for a call it can never reach. The wrappers give that
+ * one caller a copy with the branch compiled out. OP_EXEC cannot arrive on the
+ * walk form anyway — bprm_check_security is a sleepable hook and uses check().
  */
-static long check_rule_cb(__u32 i, void *data)
+static __always_inline long check_rule_body(__u32 i, void *data, __u8 can_exec)
 {
     struct policy_check_ctx *ctx = data;
     __u32 zero = 0, index;
@@ -106,9 +121,10 @@ static long check_rule_cb(__u32 i, void *data)
      * argument is the same intersection that let this rule match, recomputed
      * rather than stashed on the context because it is one AND on registers
      * already live and ctx is read by every callback iteration. */
-    if (rule_emits(r->permission & ctx->perm_mask, r->no_event_s,
+    if ((status != 'S' || !ctx->quiet_s) &&
+        rule_emits(r->permission & ctx->perm_mask, r->no_event_s,
                    r->no_event_fw, status)) {
-        if (ctx->op == OP_EXEC && !denied)
+        if (can_exec && ctx->op == OP_EXEC && !denied)
             queue_exec_event(ctx->uid, status, ctx->path, ctx->policy_id, index);
         else
             emit_event(ctx->uid, ctx->op, status, ctx->path, ctx->executable_path,
@@ -116,6 +132,18 @@ static long check_rule_cb(__u32 i, void *data)
     }
     ctx->result = denied ? -13 /* EACCES */ : 0;
     return 1;
+}
+
+static long check_rule_cb(__u32 i, void *data)
+{
+    return check_rule_body(i, data, 1);
+}
+
+/* The copy without the exec-event arm, for callers that cannot call
+ * bpf_d_path. See check_rule_body. */
+static long check_rule_cb_noexec(__u32 i, void *data)
+{
+    return check_rule_body(i, data, 0);
 }
 
 static __always_inline int task_is_exempt(void)
@@ -130,6 +158,7 @@ static __always_inline int task_is_exempt(void)
  * pam_loginuid assigns at login and survives su/sudo, so a user stays under
  * their own policy after switching to root. The operation selects the
  * permission mask rules must intersect — see op_perm_mask(): exec(1); read(2);
+ * list(16) for reading the names out of a directory;
  * delete(8) for unlink, rmdir and the source side of a rename;
  * write(4)|delete(8) for the destination side of a rename; write(4) for every
  * other filesystem change (write, truncate, chmod, chown, settime, mkdir,
@@ -139,8 +168,30 @@ static __always_inline int task_is_exempt(void)
  *
  * The employee is the second user axis: the login uid picks the policy, the
  * employee picks which of its rules apply. That is what makes a shared account —
- * one uid, many people — controllable per person. */
-static __always_inline int check_policy(const char *path, __u32 path_len, __u8 op)
+ * one uid, many people — controllable per person.
+ *
+ * `walk` selects how the current process image is resolved, and exists only
+ * because hooks that are not in sleepable_lsm_hooks cannot call bpf_d_path — see
+ * walk_file_path() in file_walk.h. It is always a literal at the call site and
+ * this function is __always_inline, so each caller keeps one arm and the other
+ * disappears; that is load-bearing, not an optimisation. A readdir program that
+ * kept the bpf_d_path arm would not verify, and every other program would pay a
+ * 48-iteration bpf_loop per check if it kept the walk arm. Do not turn `walk`
+ * into a runtime value.
+ *
+ * `op` must be a literal at the call site for the same reason, and that is a
+ * sharper constraint than it looks: queue_exec_event() also calls bpf_d_path,
+ * so unless `op == OP_EXEC` folds to false the walk-form callers drag that call
+ * into their program and fail to load. This is why the "quiet" flag below is its
+ * own argument rather than a spare bit OR'd into op — riding in the op byte
+ * would make op a runtime value and take the folding with it.
+ *
+ * `quiet_s` drops the 'S' for this one check. Only wax_check_readdir sets it,
+ * for the second and later getdents of one enumeration; it is the one argument
+ * here that is legitimately a runtime value, because it feeds nothing but a
+ * context field. It never touches the verdict, and never suppresses 'F' or 'W'. */
+static __always_inline int check_policy_impl(const char *path, __u32 path_len,
+                                             __u8 op, __u8 walk, __u8 quiet_s)
 {
     __u32 uid, zero = 0, count, exec_path_len = 0, employee_id;
     __u8 origin_bit;
@@ -186,8 +237,17 @@ static __always_inline int check_policy(const char *path, __u32 path_len, __u8 o
         mm = task->mm;
         exe_file = mm ? mm->exe_file : 0;
         if (exe_file) {
-            long n = bpf_d_path(&exe_file->f_path, executable_scratch->path,
-                                sizeof(executable_scratch->path));
+            long n;
+
+            /* Constant-folded; see the note on `walk` above. Both arms report
+             * the same thing — a length that counts the NUL — so nothing below
+             * has to know which one ran. */
+            if (walk)
+                n = walk_file_path(exe_file, executable_scratch->path,
+                                   sizeof(executable_scratch->path));
+            else
+                n = bpf_d_path(&exe_file->f_path, executable_scratch->path,
+                               sizeof(executable_scratch->path));
 
             if (n > 0) {
                 exec_resolved = 1;
@@ -220,8 +280,13 @@ static __always_inline int check_policy(const char *path, __u32 path_len, __u8 o
         .op = op == OP_RENAME_TO ? OP_RENAME : op,
         .perm_mask = op_perm_mask(op),
         .exec_resolved = exec_resolved,
+        .quiet_s = quiet_s,
     };
-    bpf_loop(MAX_RULES, check_rule_cb, &ctx, 0);
+    /* Folded at the call site; see check_rule_body. */
+    if (walk)
+        bpf_loop(MAX_RULES, check_rule_cb_noexec, &ctx, 0);
+    else
+        bpf_loop(MAX_RULES, check_rule_cb, &ctx, 0);
     /* A configured policy still audits allowed executables that did not match
      * any rule.  Allowed matching rules have already queued their own event
      * in check_rule_cb. Nothing decided this one, so it carries no rule slot —
@@ -229,6 +294,20 @@ static __always_inline int check_policy(const char *path, __u32 path_len, __u8 o
     if (op == OP_EXEC && !ctx.matched)
         queue_exec_event(uid, 'S', path, meta->meta.id, RULE_SLOT_NONE);
     return ctx.result;
+}
+
+/* The bpf_d_path form, for every hook that is in sleepable_lsm_hooks — which is
+ * all of them but wax_check_readdir. */
+static __always_inline int check_policy(const char *path, __u32 path_len, __u8 op)
+{
+    return check_policy_impl(path, path_len, op, 0, 0);
+}
+
+/* The dentry-and-mount-walk form, for hooks where bpf_d_path does not load. */
+static __always_inline int check_policy_walk(const char *path, __u32 path_len,
+                                             __u8 op, __u8 quiet_s)
+{
+    return check_policy_impl(path, path_len, op, 1, quiet_s);
 }
 
 #endif /* DOOR_FILE_POLICY_H */

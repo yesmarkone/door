@@ -60,6 +60,72 @@ long BPF_PROG(wax_check_open, struct file *file, int ret)
     return 0;
 }
 
+/* Directory enumeration: getdents(2) and getdents64(2).
+ *
+ * iterate_dir() in fs/readdir.c calls security_file_permission(file, MAY_READ)
+ * before it walks a single entry, and that is the one and only choke point for
+ * reading names out of a directory. file_open above already judges opendir() as
+ * OP_READ and continues to; what it cannot judge is the fd AFTERWARDS. A
+ * directory fd survives fork and exec and travels over SCM_RIGHTS, so until this
+ * hook existed a task could enumerate a directory it was never allowed to open,
+ * under a policy that had nothing to say about it. That is the gap list(16)
+ * closes, and it is the one place in this engine where the "already-open fd"
+ * limitation the rest of the object shares does not apply.
+ *
+ * THIS IS THE HOTTEST HOOK IN THE OBJECT. rw_verify_area() calls
+ * security_file_permission() on every read() and every write() of every regular
+ * file and socket on the host. The S_ISDIR test below is what turns all of that
+ * away: two field loads and a compare, no map lookup, no helper call, no path
+ * resolution, no task lookup. NOTHING MAY BE PLACED AHEAD OF IT — not
+ * task_is_exempt(), which is a bpf_get_current_task_btf() plus a CO-RE read, and
+ * certainly not the scratch-map lookups the path walker opens with.
+ *
+ * The mask test comes second on purpose. S_ISDIR is the question about the
+ * OBJECT and dismisses both directions of ordinary file I/O at once; the mask is
+ * the question about the INTENT and would only dismiss the write half. Past
+ * S_ISDIR the traffic is rare enough that the order stops mattering. A read(2)
+ * on a directory fd reaches rw_verify_area() with MAY_READ before the filesystem
+ * answers -EISDIR, so it is judged here too, which is right: it is an attempt to
+ * read a directory.
+ *
+ * Path resolution is check_file_walk_op(), not check(). bpf_d_path() does not
+ * load in this hook — see the comment on that function, which explains why the
+ * obvious simplification back to check() will fail the verifier. */
+SEC("lsm/file_permission")
+long BPF_PROG(wax_check_readdir, struct file *file, int mask, int ret)
+{
+    struct inode *inode;
+    __u16 imode;
+
+    if (ret) return lsm_ret(ret);
+    inode = BPF_CORE_READ(file, f_inode);
+    if (!inode) return 0;
+    imode = BPF_CORE_READ(inode, i_mode);
+    if ((imode & S_IFMT) != S_IFDIR) return 0;      /* the hot-path early-out */
+    if (!(mask & MAY_READ)) return 0;
+
+    /* One event per enumeration, not one per call. f_pos is 0 only on the first
+     * getdents of a pass, so a 40,000-entry directory read in 32KB batches
+     * reports once instead of forty times.
+     *
+     * ENFORCEMENT IS NOT GATED BY IT. Skipping the check on later calls would
+     * hand back the exact bypass this hook exists to close: an fd can change
+     * hands between two getdents, and the second caller is a different task
+     * under a different policy. Later calls are checked in full and merely
+     * decline to report an ALLOW. A deny always speaks — and note that a denied
+     * getdents returns before iterate_dir() advances f_pos, so a retry is a
+     * fresh first call anyway.
+     *
+     * The cost is one audit gap worth stating out loud: lseek(dirfd, 1,
+     * SEEK_SET) before the first getdents suppresses the 'S'. It evades the
+     * RECORD, never the ENFORCEMENT. See docs/hooks.md.
+     *
+     * OP_READDIR is passed as a literal on purpose — check_policy_impl folds on
+     * it, and the quiet flag is a separate argument so that folding survives. */
+    return lsm_ret(check_file_walk_op(file, OP_READDIR,
+                                      BPF_CORE_READ(file, f_pos) != 0));
+}
+
 SEC("lsm/path_unlink")
 long BPF_PROG(wax_check_unlink, const struct path *dir, struct dentry *dentry)
 {

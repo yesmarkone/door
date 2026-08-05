@@ -13,6 +13,13 @@
 #define SELF_NO_READ   0x08 /* file_open(R) — the /proc/kcore class only       */
 #define SELF_IS_DIR    0x10 /* also judged as the PARENT of a create or unlink */
 #define SELF_NO_UMOUNT 0x20 /* the filesystem rooted here may not be unmounted */
+/* getdents on this directory. Distinct from SELF_NO_READ, which is about a
+ * file's CONTENTS: this one is about the names of the entries inside, and the
+ * two are judged at different hooks (file_open vs file_permission). Carried only
+ * by the daemon's own directories — the pin directory, the store, the control
+ * socket's directory and --protect-paths entries — and deliberately NOT by the
+ * ancestor entries, which include "/" and "/usr". */
+#define SELF_NO_LIST   0x40
 
 /* Strength, in three steps. ARMED is 0 so a zero-initialised ARRAY slot — what
  * the map holds between its creation and the loader's first write — enforces.
@@ -44,6 +51,12 @@
  * ancestor walk is skipped outright, so an operator running --protect-paths=
  * (empty) pays nothing for a tree set that does not exist. */
 #define SCFG_HAVE_TREE_GUARD 0x0008
+/* Set when at least one published entry carries SELF_NO_LIST. Same bargain
+ * SCFG_HAVE_READ_GUARD strikes, and it matters more here: file_permission fires
+ * on every read() and write() on the host, so without this flag the program
+ * turns around on a directory test and an ARRAY lookup and never reaches the
+ * inode hash. */
+#define SCFG_HAVE_LIST_GUARD 0x0020
 
 #define SROLE_WDOG  1
 #define SROLE_AGENT 2
@@ -74,7 +87,7 @@
  * render as "unseal-key" in every line that carried it. Hence 19. */
 #define SKIND_SESSION    19
 
-/* Operation codes. door/file_const.h owns 1..18 and door/net_const.h owns
+/* Operation codes. door/file_const.h owns 1..19 and door/net_const.h owns
  * 20..26; starting at 40 leaves room for either to grow without colliding. */
 #define SOP_KILL     40
 #define SOP_PTRACE   41
@@ -90,6 +103,9 @@
 #define SOP_LOGINUID 51
 #define SOP_RDEV     52
 #define SOP_LOCKDOWN 53
+/* 54 is SOP_PIN_SWAP, which no kernel program emits — wdog raises it from
+ * userspace. See model.SelfPinSwap. */
+#define SOP_READDIR  55
 
 /* Session audit, and deliberately NOT in the 40s.
  *
@@ -126,9 +142,12 @@
 /* Same values door/file_const.h:97-98 spells out, and for the same reason. */
 #define FMODE_READ  0x00000001
 #define FMODE_WRITE 0x00000002
+/* The mask argument of security_file_permission(); see door/file_const.h. */
+#define MAY_READ    0x00000004
 
 #define S_IFMT  0170000
 #define S_IFCHR 0020000
+#define S_IFDIR 0040000
 #define S_IFBLK 0060000
 
 /* How far up the parent chain a tree-protected ancestor is looked for. This is
