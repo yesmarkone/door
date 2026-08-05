@@ -1,12 +1,12 @@
 /* SPDX-License-Identifier: GPL-2.0 OR MIT */
 /* Not standalone. Include only from door/net.c, in the order listed there,
- * after vmlinux.h and the bpf helpers. Lifted verbatim from net.c:464-610. */
+ * after vmlinux.h and the bpf helpers. Lifted verbatim from net.c:464-610, before the split. */
 #ifndef DOOR_NET_MATCH_H
 #define DOOR_NET_MATCH_H
 
 /*
  * ===========================================================================
- * Verifier-friendly glob matcher — verbatim from door.c:195-305.
+ * Verifier-friendly glob matcher — verbatim from door/file_match.h.
  * ===========================================================================
  */
 struct path_match_ctx {
@@ -132,7 +132,7 @@ static __always_inline int match_addr_prefix(const __u8 *rule, __u8 prefix_len,
     return 1;
 }
 
-/* Copied from door.c: one record, one lookup, two axes — session -> name ->
+/* Copied from file.c: one record, one lookup, two axes — session -> name ->
  * interned id, and session -> origin — resolved once per check. See there for
  * why every break in either chain yields EMPLOYEE_ID_ANY and ORIGIN_UNKNOWN
  * rather than failing closed, and why none of this may happen per rule. */

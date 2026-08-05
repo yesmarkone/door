@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 OR MIT */
 /* Not standalone. Include only from door/net.c, in the order listed there,
- * after vmlinux.h and the bpf helpers. Lifted verbatim from net.c:1174-1301. */
+ * after vmlinux.h and the bpf helpers. Lifted verbatim from net.c:1174-1301, before the split. */
 #ifndef DOOR_NET_INGRESS_H
 #define DOOR_NET_INGRESS_H
 
@@ -59,7 +59,7 @@ static long check_ingress_rule_cb(__u32 i, void *data)
     ctx->matched = 1;
     cfg = bpf_map_lookup_elem(&wax_net_runtime_config_map, &zero);
     /* Warn because this rule is observe-only, or this policy is, or the whole
-     * host is. cfg == NULL still enforces; see door.c's check_rule_cb. */
+     * host is. cfg == NULL still enforces; see file.c's check_rule_cb. */
     warn = r->warn || ctx->warning || (cfg && cfg->mode == MODE_WARN);
     denied = r->deny && !warn;
     /* Both survive bpf_loop together, and must; see check_net_rule_cb.

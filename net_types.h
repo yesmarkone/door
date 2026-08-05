@@ -1,13 +1,13 @@
 /* SPDX-License-Identifier: GPL-2.0 OR MIT */
 /* Not standalone. Include only from door/net.c, in the order listed there,
- * after vmlinux.h and the bpf helpers. Lifted verbatim from net.c:100-363. */
+ * after vmlinux.h and the bpf helpers. Lifted verbatim from net.c:100-363, before the split. */
 #ifndef DOOR_NET_TYPES_H
 #define DOOR_NET_TYPES_H
 
 /* A rule matches when every constraint it sets is satisfied; unset constraints
  * (0 family/protocol/sock_type, NET_ANY_PREFIX, full port range, empty pattern)
  * match anything. Patterns and their wildcard bitmaps carry exactly the same
- * meaning and use exactly the same matcher as door.c's struct rule.
+ * meaning and use exactly the same matcher as file.c's struct rule.
  *
  * addr is always the 16-byte normalized form: IPv4 is stored IPv4-mapped
  * (::ffff:a.b.c.d) with 96 added to prefix_len, so one matcher serves both
@@ -19,7 +19,7 @@ struct net_rule {
     __u8 exec_wild[PATH_LEN / 8];
     __u8 path_wild[PATH_LEN / 8];
     /* The second user axis, alongside the login uid that selected the policy.
-     * An interned id rather than the name itself — see struct rule in door.c,
+     * An interned id rather than the name itself — see struct rule in file.c,
      * where wax_check_sendmsg below is the program that made that necessary.
      * EMPLOYEE_ID_ANY constrains nobody. */
     __u32 employee_id;
@@ -36,7 +36,7 @@ struct net_rule {
     __u8 protocol;      /* 0=any, IPPROTO_* */
     __u8 sock_type;     /* 0=any, SOCK_STREAM 1, SOCK_DGRAM 2, SOCK_RAW 3 */
     __u8 prefix_len;    /* 0..128, or NET_ANY_PREFIX */
-    /* This one rule is observe-only; see door.c's struct policy_meta for the
+    /* This one rule is observe-only; see file.c's struct policy_meta for the
      * three scopes. Came out of the tail padding, so port_min did not move. */
     __u8 warn;
     /* Took the byte warn left, on the same terms: port_min still does not move
@@ -55,9 +55,9 @@ struct net_rule {
     __u8 _pad[3];       /* 613 */
 };                      /* 616 */
 
-/* Slot 0 of every per-uid net policy. warning is door.c's struct policy_meta
+/* Slot 0 of every per-uid net policy. warning is file.c's struct policy_meta
  * field, at the same offset and with the same meaning: the whole policy becomes
- * observe-only, its deny rules reported 'W' and not enforced. See door.c for
+ * observe-only, its deny rules reported 'W' and not enforced. See file.c for
  * why it lives in the meta rather than on each rule, and why the last byte of
  * id is not a usable home for it. */
 struct net_policy_meta {
@@ -69,8 +69,8 @@ struct net_policy_meta {
 _Static_assert(__builtin_offsetof(struct net_policy_meta, warning) == 44,
                "net_policy_meta.warning must stay at offset 44 (cmd/wdog/file.go)");
 
-/* Copied from door.c — the two objects must agree on these layouts byte for
- * byte, because they share the pinned maps holding them. See door.c for the
+/* Copied from file.c — the two objects must agree on these layouts byte for
+ * byte, because they share the pinned maps holding them. See file.c for the
  * rationale on login_uid, on origin, and on the zero-padding invariant.
  *
  * This object reads origin and nothing else of what was added with it: service
@@ -116,8 +116,8 @@ struct net_runtime_config {
     __u32 generation;
 };
 
-/* Deliberately not door.c's struct event: keeping the layouts independent means
- * door.c (and its pinned 1428-byte layout test) never has to move. Network
+/* Deliberately not file.c's struct event: keeping the layouts independent means
+ * file.c (and its pinned 1428-byte layout test) never has to move. Network
  * fields sit in the header hole so there is no trailing padding. */
 struct net_event {
     __u32 uid;                 /*    0 — audit login uid */
@@ -225,7 +225,7 @@ struct ingress_rule {
     __u8 protocol;          /* 0=any, IPPROTO_TCP 6; only TCP arrives here today */
     __u8 src_prefix_len;    /* 0..128, or NET_ANY_PREFIX */
     __u8 local_prefix_len;
-    /* This one rule is observe-only; see door.c's struct policy_meta. It took
+    /* This one rule is observe-only; see file.c's struct policy_meta. It took
      * the last padding byte, so port_min did not move but the struct is now
      * exactly full: the next flag grows it to 46. That still fits the 48-byte
      * slot the meta already sets, so unlike cred_rule it would NOT be caught by
@@ -272,7 +272,7 @@ struct net_path_scratch {
     char path[PATH_LEN];
 };
 
-/* Same 2x headroom rationale as door.c's dentry_walk_scratch: the cgroup walk
+/* Same 2x headroom rationale as file.c's dentry_walk_scratch: the cgroup walk
  * writes at a variable offset and the verifier bounds it by the worst cases
  * added together. */
 struct net_cgroup_scratch {
@@ -286,7 +286,7 @@ struct net_cgroup_scratch {
 _Static_assert(sizeof(struct net_rule) == 616, "struct net_rule must stay 616 bytes");
 /* sizeof cannot catch two adjacent __u8s swapping places, and deny, no_event_s,
  * warn and no_event_fw are four indistinguishable bytes whose meanings are not
- * interchangeable. Same treatment as door.c's struct rule. no_event_fw took the
+ * interchangeable. Same treatment as file.c's struct rule. no_event_fw took the
  * struct's last padding byte, and origin_mask is what the note there predicted:
  * it grew the struct 612 -> 616. It went on the END so that port_min and
  * port_max, which the loader writes by offset, did not move — pin all four. */

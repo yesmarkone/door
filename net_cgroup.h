@@ -1,12 +1,13 @@
 /* SPDX-License-Identifier: GPL-2.0 OR MIT */
 /* Not standalone. Include only from door/net.c, in the order listed there,
- * after vmlinux.h and the bpf helpers. Lifted verbatim from net.c:775-873. */
+ * after vmlinux.h and the bpf helpers. Lifted verbatim from net.c:775-873, before the split. */
 #ifndef DOOR_NET_CGROUP_H
 #define DOOR_NET_CGROUP_H
 
 /*
  * ===========================================================================
- * Event emission — cgroup walk and zeroing copied from door.c:307-421.
+ * Event emission — cgroup walk and zeroing copied from door/file_cgroup.h
+ * and door/file_event.h.
  * ===========================================================================
  */
 struct cgroup_walk_ctx {

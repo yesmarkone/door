@@ -12,8 +12,8 @@
 // identity map" into "session 42 logged in" — a login and logout event nothing
 // else in the system is placed to see. That is an observation, not a decision:
 // SOP_LOGIN and SOP_LOGOUT sit outside the self-defense op range on purpose, so
-// unlike everything else this object emits, Agent's --event-filter CAN hide
-// them. See door/self_const.h and the note in door/self_event.h.
+// unlike everything else this object emits, Agent's eventFilter CAN hide them.
+// See door/self_const.h and the note in door/self_event.h.
 //
 // ---------------------------------------------------------------------------
 // WHY THIS IS A SEPARATE OBJECT AND NOT PART OF door/file.c
@@ -21,19 +21,18 @@
 // Three properties, and only the first is about tidiness:
 //
 //  1. ARMING LATENCY. Verifying the file object takes the better part of a
-//     minute, nearly all of it verifier time (cmd/wagent/main.go:175). Until it
-//     finishes, `pkill wdog` and `bpftool map delete` both work. This object has
-//     no bpf_loop over policy, no bpf_d_path, no glob matcher and no 1440-byte
-//     event, so it loads and attaches in about a second — and wdog attaches it
-//     FIRST. The undefended window shrinks from ~45s to ~1s, which matters more
-//     once a supervisor is restarting wdog on its own.
-//  2. IT CANNOT BE DESELECTED. --file-hooks is a supported way to run on a
-//     kernel missing an attach point (docs/build.md). A hole in the daemon's
-//     protection of itself is not the same kind of thing, so it lives behind a
-//     different flag with a different default.
-//  3. VERIFIER BUDGET. door/net.c:12-31 records that wax_check_sendmsg came
-//     close to the million-instruction ceiling on 5.14. Nothing here can push
-//     it closer.
+//     minute, nearly all of it verifier time. Until it finishes, `pkill wdog`
+//     and `bpftool map delete` both work. This object has no bpf_loop over
+//     policy, no bpf_d_path, no glob matcher and no 1440-byte event, so it loads
+//     and attaches in about a second — and wdog attaches it FIRST. The
+//     undefended window shrinks from ~45s to ~1s, which matters more once a
+//     supervisor is restarting wdog on its own.
+//  2. IT CANNOT BE DESELECTED. fileHooks is a supported way to run on a kernel
+//     missing an attach point (docs/build.md). A hole in the daemon's protection
+//     of itself is not the same kind of thing, so it lives behind a different
+//     option with a different default.
+//  3. VERIFIER BUDGET. wax_check_sendmsg in the network object came close to the
+//     million-instruction ceiling on 5.14. Nothing here can push it closer.
 //
 // Attach ORDER buys arming latency and nothing else, and it is worth saying so
 // before someone "optimises" it away: BPF LSM programs are attached as
@@ -46,12 +45,12 @@
 // COPIED FROM door/file.c — KEEP IN SYNC. Only two things, and the shortness of
 // this list is the design:
 //
-//   lsm_ret()        door/file_path.h:186-202  ->  door/self_check.h
-//   NSEC_PER_CLOCK   door/file_const.h:23      ->  door/self_const.h
+//   lsm_ret()        door/file_path.h   ->  door/self_check.h
+//   NSEC_PER_CLOCK   door/file_const.h  ->  door/self_const.h
 //
 // DELIBERATELY NOT COPIED, and it has to stay that way:
 //
-//   task_is_exempt()   door/file_policy.h:111 — this object exists precisely to
+//   task_is_exempt()   door/file_policy.h — this object exists precisely to
 //     judge the tasks that one waves through. A systemd-started task with
 //     sessionid -1 is the ATTACKER here, not an exempt daemon. If that function
 //     ever appears in this file the whole layer is defeated in one line.

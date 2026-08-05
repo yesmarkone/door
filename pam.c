@@ -6,69 +6,59 @@
 // The login uid alone cannot tell two people apart on an account like `oracle`
 // or `wasadm`. PAM is the only place that knows which of them is arriving, so
 // this module writes that name into the BPF map wdog pins, keyed by the audit
-// session id. door/file.c and door/net.c then resolve it on every check —
-// session id to name here, name to the id their rules carry via a second table
-// wdog maintains — and match that against each rule's employee_id.
+// session id. door/file.c and door/net.c resolve it on every check — session id
+// to name here, name to the id their rules carry via a second table wdog
+// maintains — and match that against each rule's employee_id. This module only
+// ever writes the name; the ids belong to whatever policy is installed.
 //
-// This module only ever writes the name. It knows nothing about ids, which
-// belong to whatever policy happens to be installed and change on nobody's
-// schedule but wdog's.
+// It records the session's ORIGIN for the same reason: nothing downstream can
+// tell a child of sshd from a child of crond. /etc/pam.d/crond runs
+// pam_loginuid too, so a cron job carries a real audit session id and the
+// target user's login uid exactly as an ssh login does, and the kernel sees two
+// tasks that agree on every field it has. The difference survives only in PAM
+// (PAM_SERVICE, PAM_RHOST), and this module is the code loaded into sshd on one
+// login and crond on the next — so it classifies once, here.
 //
-// It records a second thing for the same reason — because it is the only code
-// on the host in a position to know it. A child of sshd is a remote user's
-// process and a child of crond is the system's, and NOTHING downstream can tell
-// them apart: /etc/pam.d/crond runs pam_loginuid too, so a cron job carries a
-// real audit session id and the target user's login uid exactly as an ssh login
-// does. The kernel sees two tasks that agree on every field it has. PAM is
-// where the difference still exists, in PAM_SERVICE and PAM_RHOST, and this
-// module is loaded into sshd on one login and crond on the next. So it
-// classifies the session's origin once, here, and writes it beside the name.
+// Origin is therefore a property of the SESSION, not of the process: every
+// descendant inherits it through task->sessionid, with no process tree to walk.
+// Ancestry rots (setsid, nohup, a shell under tmux); an audit session id does
+// not. It rides through su and sudo untouched for the same reason the login uid
+// does — neither runs pam_loginuid, so neither opens a new session.
 //
-// That makes origin a property of the SESSION, not of the process, which is the
-// whole point: every descendant inherits it through task->sessionid without
-// anything having to walk a process tree. Ancestry rots — a process survives
-// its login through setsid or nohup, a shell under tmux is not a child of sshd
-// at all — and an audit session id does not. It also rides through su and sudo
-// untouched, for the same reason the login uid does: neither runs
-// pam_loginuid, so neither opens a new session.
-//
-// The stacks that most need this are the ones with nobody to name, so recording
-// the origin must not require an identity. See `origin_only`:
+// The stacks that most need the origin are the ones with nobody to name, so
+// recording it must not require an identity. See `origin_only`:
 //
 //     # /etc/pam.d/crond, /etc/pam.d/atd
 //     session    required   pam_loginuid.so
 //     session    optional   pam_wood.so origin=scheduled origin_only
 //
-// Deliberately no libbpf. All this needs is three bpf(2) commands, and the
-// module is loaded into sshd's address space on every login — a dependency on
-// libbpf (and through it zlib and elfutils) is a liability there, and it would
-// make libbpf a runtime requirement on every deployed host. See pam/Makefile.
+// Deliberately no libbpf: this needs three bpf(2) commands, and the module is
+// loaded into sshd's address space on every login. Depending on libbpf (and
+// through it zlib and elfutils) there is a liability, and it would make libbpf a
+// runtime requirement on every deployed host. See pam/Makefile.
 //
-// Placement in the stack matters, and so does the control flag:
+// Placement and control flag:
 //
 //     session    required   pam_loginuid.so
 //     session    required   pam_wood.so
 //
-// pam_loginuid.so is what assigns the audit session id, so this module must run
-// after it; before it, /proc/self/sessionid still reads -1 and there is nothing
-// to key on.
+// pam_loginuid.so assigns the audit session id, so this module must run after
+// it; before it, /proc/self/sessionid still reads -1 and there is nothing to key
+// on.
 //
 // `required`, because a login this module cannot identify is refused:
 // open_session returns PAM_SESSION_ERR when the variable naming the person is
-// unset or empty. That is the one path here that fails a login. Everything else
-// that can go wrong — no audit session id yet, no pin to write to, a full map —
-// still returns PAM_SUCCESS and only reports to syslog. Those leave the session
-// unidentified, and an unidentified session is either already contained by the
-// catch-all deny rule the policy carries, or wdog is down and there is no policy
-// to enforce at all, in which case refusing logins buys nothing and costs an
-// outage. An unset variable is different in kind: the front-end module that was
-// supposed to say who is arriving never did, and there is nothing to fall back
-// on — so the account is not being used as the audit trail requires.
+// unset or empty. That is the ONLY path here that fails a login. Everything else
+// — no audit session id yet, no pin to write to, a full map — returns
+// PAM_SUCCESS and reports to syslog, because an unidentified session is either
+// already contained by the policy's catch-all deny rule or wdog is down and
+// there is no policy at all, and refusing logins then buys nothing. An unset
+// variable is different in kind: the front-end module that was supposed to say
+// who is arriving never did.
 //
-// The control flag decides what that return code costs, so `optional` restores
-// the previous never-fail behaviour verbatim. An account that must survive a
-// broken identification path (root, for recovery) belongs in the stack rather
-// than in an option here:
+// `optional` restores the previous never-fail behaviour verbatim. An account
+// that must survive a broken identification path (root, for recovery) belongs in
+// the stack rather than in an option here:
 //
 //     session    [success=1 default=ignore]   pam_succeed_if.so user = root quiet
 //     session    required                     pam_wood.so

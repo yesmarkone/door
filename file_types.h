@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 OR MIT */
 /* Not standalone. Include only from door/file.c, in the order listed there,
- * after vmlinux.h and the bpf helpers. Lifted verbatim from file.c:156-495. */
+ * after vmlinux.h and the bpf helpers. Lifted verbatim from file.c:156-495, before the split. */
 #ifndef DOOR_FILE_TYPES_H
 #define DOOR_FILE_TYPES_H
 
@@ -287,8 +287,9 @@ struct pid_image {
 };
 
 /* What PAM recorded for one audit session. pam_wood.so fills this at
- * open_session and removes it at close_session; wdog reaps records whose
- * session no longer has a live process.
+ * open_session and marks it SESSION_CLOSED (not deleted) at close_session; wdog
+ * reaps records whose session no longer has a live process. See the origin
+ * paragraphs below for why the record lingers.
  *
  * login_uid is not a matching criterion — it exists so a record left behind by
  * a session whose id has since been reused cannot lend its name to a different
@@ -307,36 +308,30 @@ struct pid_image {
  * a fixed-size block of bytes — junk after the terminator would look up nothing
  * at all. pam_wood.c memsets the value before filling it for this reason.
  *
- * origin is the third user axis and the only one the kernel reads from the
- * three fields added last. It took what had been _pad, so login_time_ns did not
- * move and the offset assert below is the one that was already there. See
- * ORIGIN_* in door/file_const.h for what it is and why it lives on the session
- * rather than on the process.
+ * origin is the third user axis and the only one of the three fields added last
+ * that the kernel reads. It took what had been _pad, so login_time_ns did not
+ * move. See ORIGIN_* in door/file_const.h for what it is and why it lives on the
+ * session rather than on the process.
  *
- * Its LOW BYTE is the origin; the high bits are flags, and SESSION_CLOSED is the
- * only one so far. Read it through ORIGIN_VALUE() and never raw. That packing is
- * deliberate rather than thrifty: a flag in a field of its own would have grown
- * this struct, and growing it is the deployment hazard written up below — the
- * pin has to be discarded and every module in lockstep. The spare bits were
- * already paid for.
+ * Its LOW BYTE is the origin; the high bits are flags, so far only
+ * SESSION_CLOSED. Read it through ORIGIN_VALUE() and never raw. Packing rather
+ * than adding a field is deliberate: growing this struct is the deployment
+ * hazard written up below, and the spare bits were already paid for.
  *
- * SESSION_CLOSED says pam_wood.so has run close_session while processes still
- * carry this session id. The record then LINGERS instead of being deleted, and
- * wdog's reaper removes it once the last of those processes is gone. What that
- * buys is the case the origin axis was weakest on: a login whose processes
+ * SESSION_CLOSED says close_session has run while processes still carry this
+ * session id. The record LINGERS until wdog's reaper sees the last of them go.
+ * That covers the case the origin axis was weakest on: a login whose processes
  * outlive it — a remote-IDE server, nohup, tmux, setsid — used to lose both user
  * axes at logout and match only rules that constrain neither.
  *
  * service and rhost are the raw PAM_SERVICE and PAM_RHOST, recorded whatever
- * origin was decided — including when it was decided to be ORIGIN_UNKNOWN.
- * NOTHING IN THE KERNEL READS THEM. They exist so an operator reading an audit
- * line can see what the module actually saw, which is what turns "why is this
- * session unknown" from a guess into a lookup: a site-local PAM service the
- * built-in table has never heard of shows up by name, and the remedy is an
- * origin= option in that stack. rhost carries what sshd put there — normally
- * the client address, a hostname where UseDNS is on — and is empty for every
- * local origin. Both are NUL-terminated and zero-padded, on the same terms as
- * employee_name, though neither is a hash key.
+ * origin was decided (ORIGIN_UNKNOWN included). NOTHING IN THE KERNEL READS
+ * THEM. They exist so an operator reading an audit line sees what the module
+ * saw, which turns "why is this session unknown" from a guess into a lookup: a
+ * site-local PAM service the built-in table has never heard of shows up by name,
+ * and the remedy is an origin= option in that stack. rhost carries what sshd put
+ * there and is empty for every local origin. Both are NUL-terminated and
+ * zero-padded like employee_name, though neither is a hash key.
  *
  * Their cost is real and worth stating: this value went 80 -> 176 bytes, and at
  * max_entries 65536 the preallocated map went 5.2MB -> 11.5MB. See

@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 OR MIT */
 /* Not standalone. Include only from door/net.c, in the order listed there,
- * after vmlinux.h and the bpf helpers. Lifted verbatim from net.c:611-774. */
+ * after vmlinux.h and the bpf helpers. Lifted verbatim from net.c:611-774, before the split. */
 #ifndef DOOR_NET_SOCK_H
 #define DOOR_NET_SOCK_H
 

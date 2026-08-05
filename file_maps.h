@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 OR MIT */
 /* Not standalone. Include only from door/file.c, in the order listed there,
- * after vmlinux.h and the bpf helpers. Lifted verbatim from file.c:496-672. */
+ * after vmlinux.h and the bpf helpers. Lifted verbatim from file.c:496-672, before the split. */
 #ifndef DOOR_FILE_MAPS_H
 #define DOOR_FILE_MAPS_H
 
@@ -101,8 +101,8 @@ struct {
 } wax_runtime_config_map SEC(".maps");
 
 /* Audit session id -> the employee PAM logged in on it. Written from userspace
- * only (pam_wood.so on login/logout, wdog's reaper for sessions that died
- * without a close_session), read here on every check.
+ * only (pam_wood.so on login/logout, wdog's reaper once a session's last process
+ * is gone), read here on every check.
  *
  * Pinned, and declared identically in net.c, because the two BPF objects cannot
  * share a map any other way: LIBBPF_PIN_BY_NAME makes whichever object loads
@@ -120,18 +120,14 @@ struct {
  * seconds apart to collect a dead one, and pam_wood.c returns PAM_SUCCESS when
  * the update fails — so roughly four thousand logins used to leave every
  * subsequent session unidentified, with every employeeName-scoped rule quietly
- * ceasing to match and nothing in the log but a PAM warning. At 176 bytes an
- * entry this costs about 11.5MB and moves that threshold out of reach.
+ * ceasing to match and nothing in the log but a PAM warning.
  *
- * That 11.5MB was 5.2MB before the session origin axis added service and rhost
- * to the record (80 -> 176 bytes), and the whole of it is preallocated: this is
- * a plain hash without BPF_F_NO_PREALLOC, so the cost is paid at load whether
- * anyone is logged in or not. Both figures count values only; `bpftool map show`
- * reports 16.2MB of memlock for this map, the rest being the bucket array and
- * per-element overhead. It is the price of the two strings, which nothing
- * matches on and which exist to make an audit line answer "what did PAM
- * actually see" — see struct session_identity. Halving max_entries would buy it
- * back and give up the security bound above; the bound is worth more.
+ * At 176 bytes an entry that costs about 11.5MB of values (5.2MB before the
+ * session origin axis added service and rhost, 80 -> 176 bytes), all of it
+ * preallocated — a plain hash without BPF_F_NO_PREALLOC pays at load whether
+ * anyone is logged in or not. `bpftool map show` reports 16.2MB of memlock, the
+ * rest being the bucket array and per-element overhead. Halving max_entries
+ * would buy that back and give up the bound above; the bound is worth more.
  *
  * Changing max_entries — or the value size, which the origin axis did — changes
  * the pinned map's shape, so checkPin (cmd/wdog/session.go) refuses to start

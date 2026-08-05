@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 OR MIT */
 /* Not standalone. Include only from door/file.c, in the order listed there,
- * after vmlinux.h and the bpf helpers. Lifted verbatim from file.c:1062-1267. */
+ * after vmlinux.h and the bpf helpers. Lifted verbatim from file.c:1062-1267, before the split. */
 #ifndef DOOR_FILE_POLICY_H
 #define DOOR_FILE_POLICY_H
 

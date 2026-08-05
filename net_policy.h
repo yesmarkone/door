@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 OR MIT */
 /* Not standalone. Include only from door/net.c, in the order listed there,
- * after vmlinux.h and the bpf helpers. Lifted verbatim from net.c:955-1173. */
+ * after vmlinux.h and the bpf helpers. Lifted verbatim from net.c:955-1173, before the split. */
 #ifndef DOOR_NET_POLICY_H
 #define DOOR_NET_POLICY_H
 
@@ -22,7 +22,7 @@ struct net_check_ctx {
     __u32 exec_path_len;
     /* The matching rule's slot, for the same reason status and emit are here:
      * the emit happens after bpf_loop, so what the callback decided has to
-     * survive it. door.c's file, proc and cred contexts carry no such field —
+     * survive it. file.c's file, proc and cred contexts carry no such field —
      * they emit from inside the callback and pass the slot as an argument. */
     __u32 rule_slot;
     __u8 op;
@@ -66,7 +66,7 @@ static long check_net_rule_cb(__u32 i, void *data)
     if (!slot || !slot->rule.enabled) return 0;
     r = &slot->rule;
     if (!(r->permission & ctx->perm_bit)) return 0;
-    /* Scalars only, on purpose: see struct rule::employee_id in door.c. */
+    /* Scalars only, on purpose: see struct rule::employee_id in file.c. */
     if (r->employee_id != EMPLOYEE_ID_ANY && r->employee_id != ctx->employee_id)
         return 0;
     if (r->origin_mask && !(r->origin_mask & ctx->origin_bit)) return 0;
@@ -110,12 +110,12 @@ static long check_net_rule_cb(__u32 i, void *data)
     /* Warn because this rule is observe-only, or this policy is, or the whole
      * host is. cfg == NULL still enforces, so a failed runtime_config lookup
      * remains fail-closed for every rule that leaves both flags clear; see
-     * door.c's check_rule_cb. */
+     * file.c's check_rule_cb. */
     warn = r->warn || ctx->warning || (cfg && cfg->mode == MODE_WARN);
     denied = r->deny && !warn;
     /* Both survive bpf_loop together, and must: the no_event masks are judged
      * against the status this rule decided, and the emit happens after the
-     * loop. perm_bit really is one bit here — unlike door.c's perm_mask — so
+     * loop. perm_bit really is one bit here — unlike file.c's perm_mask — so
      * the intersection is that bit or nothing, and it matched. */
     ctx->status = r->deny ? (warn ? 'W' : 'F') : 'S';
     ctx->emit = rule_emits(r->permission & ctx->perm_bit, r->no_event_s,
@@ -125,9 +125,9 @@ static long check_net_rule_cb(__u32 i, void *data)
     return 1;   /* FIRST MATCH WINS */
 }
 
-/* Copied from door.c:591-596. Tasks with no audit session (systemd-started
+/* Copied from door/file_policy.h. Tasks with no audit session (systemd-started
  * daemons, kernel threads) bypass every check, exactly as they do for the file
- * controls in door.c — the control axis is the logged-in user. */
+ * controls in file.c — the control axis is the logged-in user. */
 static __always_inline int task_is_exempt(void)
 {
     struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
@@ -141,7 +141,7 @@ static __always_inline int task_is_exempt(void)
  * policy after switching to root. A rule's employee_name narrows it further to
  * one person on that account — the login uid picks the policy, the name picks
  * which of its rules apply. The first rule whose permission bit and every
- * constraint match decides the outcome. Unlike door.c there is no audit event
+ * constraint match decides the outcome. Unlike file.c there is no audit event
  * for the no-rule-matched case; only a matching rule emits. */
 static __always_inline int check_net_policy(const struct net_target *t, __u8 op,
                                             __u8 perm_bit)
@@ -221,7 +221,7 @@ static __always_inline int check_net_policy(const struct net_target *t, __u8 op,
 
 /*
  * Strict LSM verifiers (e.g. RHEL 9.8, kernel 5.14.0-687) require every hook to
- * return a value provably within [-4095, 0]; see door.c:852-879 for the full
+ * return a value provably within [-4095, 0]; see door/file_path.h for the full
  * rationale behind the `long` return type and the clamp.
  */
 static __always_inline long lsm_ret(long r)

@@ -10,7 +10,7 @@
  * translation unit, and the order below reproduces file.c's original
  * top-to-bottom order exactly. Nothing in these fragments is forward-declared —
  * there is not a single prototype in the whole object — so reordering them will
- * not compile. Each header names the line range it was lifted from. */
+ * not compile. Each header names the line range it was lifted from in that pre-split file. */
 #include "file_const.h"    /* also op_perm_mask(), rule_emits() */
 #include "file_types.h"
 #include "file_maps.h"

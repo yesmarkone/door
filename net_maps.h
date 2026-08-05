@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 OR MIT */
 /* Not standalone. Include only from door/net.c, in the order listed there,
- * after vmlinux.h and the bpf helpers. Lifted verbatim from net.c:364-463. */
+ * after vmlinux.h and the bpf helpers. Lifted verbatim from net.c:364-463, before the split. */
 #ifndef DOOR_NET_MAPS_H
 #define DOOR_NET_MAPS_H
 
@@ -26,11 +26,11 @@ struct {
     __type(value, struct net_runtime_config);
 } wax_net_runtime_config_map SEC(".maps");
 
-/* Audit session id -> the employee PAM logged in on it. THE SAME MAP door.c
+/* Audit session id -> the employee PAM logged in on it. THE SAME MAP file.c
  * declares, not a copy: LIBBPF_PIN_BY_NAME means whichever object loads second
  * attaches to the one the first created, which is the only way these two
  * objects can share state. Every attribute below must therefore stay identical
- * to door.c's declaration, or the second load fails on a layout mismatch. */
+ * to file.c's declaration, or the second load fails on a layout mismatch. */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 65536); /* KEEP IN SYNC with door/file_maps.h */
@@ -39,9 +39,9 @@ struct {
     __uint(pinning, LIBBPF_PIN_BY_NAME);
 } wax_session_identity SEC(".maps");
 
-/* Employee name -> the id rules carry. THE SAME MAP door.c declares, shared
+/* Employee name -> the id rules carry. THE SAME MAP file.c declares, shared
  * through its pin; both objects must resolve a name to the same id. Every
- * attribute must stay identical to door.c's declaration. */
+ * attribute must stay identical to file.c's declaration. */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 4096);

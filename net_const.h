@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 OR MIT */
 /* Not standalone. Include only from door/net.c, in the order listed there,
- * after vmlinux.h and the bpf helpers. Lifted verbatim from net.c:37-99. */
+ * after vmlinux.h and the bpf helpers. Lifted verbatim from net.c:37-99, before the split. */
 #ifndef DOOR_NET_CONST_H
 #define DOOR_NET_CONST_H
 
@@ -37,7 +37,7 @@
 #define MAX_RULES 512
 /* Slot 0 of an inner policy map holds the metadata, so a rule always sits at
  * 1 + its position in the config array and slot 0 can never name one — which is
- * what makes it the event's "no rule matched" value. A second copy of door.c's
+ * what makes it the event's "no rule matched" value. A second copy of file.c's
  * definition: the two objects share no header, only the layouts they both
  * describe, the same way struct session_identity is duplicated below. */
 #define RULE_SLOT_NONE 0u
@@ -45,7 +45,7 @@
 #define MODE_ENFORCE 0
 #define MODE_WARN    1
 
-/* Network operation codes. door.c owns 1..13 for file-class operations; both
+/* Network operation codes. file.c owns 1..13 for file-class operations; both
  * objects publish into the same userspace event stream, so these must not
  * collide with it. */
 #define OP_NET_CREATE  20
@@ -57,7 +57,7 @@
 #define OP_NET_INGRESS 26
 
 /* Permission bits selecting which operations a network rule governs. This is a
- * namespace of its own; it is unrelated to door.c's execute/read/write bits.
+ * namespace of its own; it is unrelated to file.c's execute/read/write bits.
  * "listening" is bind|listen (12): UDP and raw sockets never call listen(), and
  * splitting the two keeps a client pinning its source port with bind() out of
  * the way of a rule that only means to stop servers. */
