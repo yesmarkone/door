@@ -86,6 +86,9 @@
  * selfKindCgroup. A SKIND_ here at 17 would not collide at build time and would
  * render as "unseal-key" in every line that carried it. Hence 19. */
 #define SKIND_SESSION    19
+/* 20 AND 21 ARE ALSO TAKEN, by selfKindStateKey and selfKindAgentConfig, on the
+ * same terms: the loader assigns them and the kernel only echoes them back. Any
+ * new SKIND_ the kernel itself produces has to start at 22. */
 
 /* Operation codes. door/file_const.h owns 1..19 and door/net_const.h owns
  * 20..26; starting at 40 leaves room for either to grow without colliding. */
