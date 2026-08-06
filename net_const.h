@@ -41,6 +41,13 @@
  * definition: the two objects share no header, only the layouts they both
  * describe, the same way struct session_identity is duplicated below. */
 #define RULE_SLOT_NONE 0u
+/* The host fallback policy's reserved key in wax_active_net_policy_by_uid. A
+ * second copy of file.c's definition on the same terms as RULE_SLOT_NONE above,
+ * and it must KEEP IN SYNC: the two objects install from one loader, so a
+ * disagreement here would leave the network rules of a fallback policy silently
+ * unreachable while its file rules worked. door/file_const.h carries the
+ * reasoning, including why the entry functions guard this value explicitly. */
+#define FALLBACK_UID 0xFFFFFFFFu
 #define MAX_CGROUP_DEPTH 32
 #define MODE_ENFORCE 0
 #define MODE_WARN    1

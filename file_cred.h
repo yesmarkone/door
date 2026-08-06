@@ -216,7 +216,23 @@ static __always_inline int check_cred_policy(const struct cred *new_cred,
 
     task = (struct task_struct *)bpf_get_current_task_btf();
     uid = BPF_CORE_READ(task, loginuid.val);
+    /* The host fallback policy; door/file_policy.h carries the reasoning for all
+     * four copies of this. Kept identical to it apart from the map name.
+     *
+     * Worth one extra note here. The comment on struct cred_rule explains that
+     * there is no "from" field because the policy key already IS the source
+     * identity. Under the fallback that key is not one uid but "every uid with
+     * no policy of its own", so a credRule here reads as "no unmanaged user may
+     * become X" — still a source-scoped rule, just scoped to a set. */
+    if (wax_fallback_on && uid == FALLBACK_UID) return 0;
     inner = bpf_map_lookup_elem(&wax_active_cred_policy_by_uid, &uid);
+    if (wax_fallback_on && !inner) {
+        __u32 fb = FALLBACK_UID;
+        void *fallback = bpf_map_lookup_elem(&wax_active_cred_policy_by_uid, &fb);
+
+        if (fallback && !bpf_map_lookup_elem(&wax_managed_uids, &uid))
+            inner = fallback;
+    }
     if (!inner) return 0;
     meta = bpf_map_lookup_elem(inner, &zero);
     if (!meta) return 0;

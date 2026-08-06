@@ -26,6 +26,31 @@ struct {
     __type(value, struct net_runtime_config);
 } wax_net_runtime_config_map SEC(".maps");
 
+/* The login uids that have a policy of their own — the set the host fallback
+ * policy at FALLBACK_UID does not cover. NOT the map file.c declares, unlike
+ * wax_session_identity below: this one is deliberately unpinned, so each object
+ * gets its own copy and wdog writes both from one source. That is the same
+ * split, and for the same reason, as wax_net_runtime_config_map above.
+ *
+ * Unpinned because the answer must not outlive wdog. A stale pin claiming a uid
+ * is managed, read by a restarted wdog that has not yet replayed its policies,
+ * would exempt that uid from the fallback during exactly the window the fallback
+ * exists to cover. door/file_maps.h carries the rest of the reasoning, including
+ * why the value is a presence flag and must never become a per-space bitmask. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);  /* KEEP IN SYNC with door/file_maps.h */
+    __type(key, __u32);         /* login uid */
+    __type(value, __u8);
+} wax_net_managed_uids SEC(".maps");
+
+/* The fallback policy's load-time gate for this object; see wax_fallback_on in
+ * door/file_maps.h. Separate from the file object's so the two can be retreated
+ * independently — wax_check_sendmsg is the program with the least verifier
+ * budget left, and --fallback-policy=file exists to leave it out while the file,
+ * process and credential controls keep theirs. */
+volatile const __u8 wax_net_fallback_on = 0;
+
 /* Audit session id -> the employee PAM logged in on it. THE SAME MAP file.c
  * declares, not a copy: LIBBPF_PIN_BY_NAME means whichever object loads second
  * attaches to the one the first created, which is the only way these two

@@ -155,7 +155,17 @@ static __always_inline int check_proc_policy(struct task_struct *p, __u8 op,
     if (task_is_exempt()) return 0;
     task = (struct task_struct *)bpf_get_current_task_btf();
     uid = BPF_CORE_READ(task, loginuid.val);
+    /* The host fallback policy; door/file_policy.h carries the reasoning for all
+     * four copies of this. Kept identical to it apart from the map name. */
+    if (wax_fallback_on && uid == FALLBACK_UID) return 0;
     inner = bpf_map_lookup_elem(&wax_active_proc_policy_by_uid, &uid);
+    if (wax_fallback_on && !inner) {
+        __u32 fb = FALLBACK_UID;
+        void *fallback = bpf_map_lookup_elem(&wax_active_proc_policy_by_uid, &fb);
+
+        if (fallback && !bpf_map_lookup_elem(&wax_managed_uids, &uid))
+            inner = fallback;
+    }
     if (!inner) return 0;
     meta = bpf_map_lookup_elem(inner, &zero);
     if (!meta) return 0;

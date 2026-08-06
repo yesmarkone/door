@@ -119,6 +119,22 @@
  * what a record produced by an older object, whose bytes there are zero, reports.
  * The alternative, an all-ones sentinel, would make such a record claim rule 0. */
 #define RULE_SLOT_NONE 0u
+/* The reserved key the host fallback policy occupies in every
+ * wax_active_*_by_uid map. It governs the login uids that have no policy of
+ * their own; see wax_managed_uids in door/file_maps.h for how those are told
+ * apart from a uid whose policy simply carries no rules of one kind.
+ *
+ * Not a uid: (uid_t)-1 is AUDIT_UID_UNSET, so setuid(2) refuses it and no login
+ * can produce it. That same fact is a trap, and the entry functions guard it
+ * explicitly. A task whose login uid was never set reads exactly this value
+ * from task->loginuid, and a bare lookup would hand it the fallback policy on
+ * the FIRST lookup, without passing the managed-uid gate. Such a task is exempt
+ * today — audit_set_loginuid() clears loginuid and sessionid together, so
+ * task_is_exempt() has already returned — but that safety lives in the CALLERS
+ * (door/file_path.h, door/net_progs.h), not in the entry functions. A future
+ * hook that forgot the exempt check would not merely leak an unchecked path; it
+ * would attach the fallback to every systemd-started daemon on the host. */
+#define FALLBACK_UID 0xFFFFFFFFu
 #define OP_EXEC    1
 #define OP_READ    2
 #define OP_WRITE   3

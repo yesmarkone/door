@@ -160,7 +160,19 @@ static __always_inline int check_net_policy(const struct net_target *t, __u8 op,
 
     task = (struct task_struct *)bpf_get_current_task_btf();
     uid = BPF_CORE_READ(task, loginuid.val);
+    /* The host fallback policy, in the shape door/file_policy.h explains at
+     * length — the reserved-key guard, the managed-uid gate, and why the
+     * fallback shares this outer map rather than getting an array of its own.
+     * Kept identical to that copy on purpose; only the map name differs. */
+    if (wax_net_fallback_on && uid == FALLBACK_UID) return 0;
     inner = bpf_map_lookup_elem(&wax_active_net_policy_by_uid, &uid);
+    if (wax_net_fallback_on && !inner) {
+        __u32 fb = FALLBACK_UID;
+        void *fallback = bpf_map_lookup_elem(&wax_active_net_policy_by_uid, &fb);
+
+        if (fallback && !bpf_map_lookup_elem(&wax_net_managed_uids, &uid))
+            inner = fallback;
+    }
     if (!inner) return 0;
     meta = bpf_map_lookup_elem(inner, &zero);
     if (!meta) return 0;

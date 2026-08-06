@@ -53,6 +53,53 @@ struct {
     __array(values, typeof(wax_cred_policy_template));
 } wax_active_cred_policy_by_uid SEC(".maps");
 
+/* The login uids that have a policy of their own — the set the host fallback
+ * policy at FALLBACK_UID does NOT cover.
+ *
+ * It exists because "no inner map" does not mean "no policy" for three of the
+ * four spaces. wdog creates a proc, cred or net inner map only when the policy
+ * carries rules of that kind, so a policy with fileRules alone leaves
+ * wax_active_proc_policy_by_uid empty for its uid. Falling back on that
+ * emptiness would hand that user the fallback's procRules, and the fallback is
+ * a per-uid decision rather than a per-rule-kind one: a uid with a policy is
+ * out of the fallback's reach in every space, including the ones its own policy
+ * says nothing about. Leaving procRules out is an operator saying "this uid's
+ * kill and ptrace are ungoverned", and a host-wide default must not quietly
+ * overrule it.
+ *
+ * THE VALUE IS A PRESENCE FLAG AND MUST NOT BECOME A PER-SPACE BITMASK. A mask
+ * would reintroduce exactly the chaining the paragraph above rejects.
+ *
+ * Deliberately NOT pinned, unlike wax_session_identity and wax_employee_ids
+ * below. Those two must outlive wdog; this one must not. A stale pin claiming a
+ * uid is managed, read by a restarted wdog that has not yet replayed its
+ * policies, would exempt that uid from the fallback during exactly the window
+ * the fallback exists to cover. Not pinning is also why net.c declares its own
+ * copy rather than sharing this one — the same split, and for the same reason,
+ * as wax_runtime_config_map and wax_net_runtime_config_map. wdog writes both
+ * from one source. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);  /* the bound the outer policy maps already have */
+    __type(key, __u32);         /* login uid */
+    __type(value, __u8);        /* always 1; see above */
+} wax_managed_uids SEC(".maps");
+
+/* The fallback policy's load-time gate. Written by the loader with
+ * CollectionSpec.RewriteConstants before the collection is built, exactly like
+ * door/self_maps.h's constants, so the verifier folds it to an immediate and
+ * dead-code eliminates every branch it guards. With --fallback-policy=off the
+ * entry functions verify as the byte-identical programs they were before this
+ * feature existed.
+ *
+ * That retreat is not decoration. The rule loop below these branches carries two
+ * nested glob matchers, and a state split ahead of it once put wax_check_sendmsg
+ * in net.c past the verifier's million-instruction ceiling outright — the object
+ * stopped loading. This feature is believed not to split that state (both
+ * lookups hit one outer map, so the two arms carry one inner_map_meta and merge),
+ * but "believed" is what the gate is for. */
+volatile const __u8 wax_fallback_on = 0;
+
 /* tgid -> the image that process is running.
  *
  * Written on exec (where bpf_d_path works), inherited on fork (a process that

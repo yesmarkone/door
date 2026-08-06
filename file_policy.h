@@ -207,8 +207,42 @@ static __always_inline int check_policy_impl(const char *path, __u32 path_len,
 
     task = (struct task_struct *)bpf_get_current_task_btf();
     uid = BPF_CORE_READ(task, loginuid.val);
+    /* FALLBACK_UID is AUDIT_UID_UNSET; see door/file_const.h. A task reading it
+     * has no login uid, is therefore exempt, and every caller has already
+     * returned — but if that ever stopped being true, the lookup below would
+     * hand it the fallback policy instead of waving it through. Two instructions
+     * to make the invariant local rather than a property of eleven call sites. */
+    if (wax_fallback_on && uid == FALLBACK_UID) return 0;
     inner = bpf_map_lookup_elem(&wax_active_policy_by_uid, &uid);
+    /* No policy of this user's own, and none anywhere for this uid: the host
+     * fallback decides. A uid WITH a policy never reaches the fallback, not even
+     * for the rule kinds its own policy leaves empty — wax_managed_uids is what
+     * tells "unmanaged" apart from "managed, no rules of this kind", and
+     * door/file_maps.h says why the difference matters.
+     *
+     * The fallback lives in the SAME outer map under a reserved key on purpose.
+     * Both lookups then carry that map's one inner_map_meta, so the verifier
+     * types the two arms identically and merges them, and the rule loop below —
+     * with its two nested glob matchers — is explored once. A separate global
+     * array, the shape check_ingress uses, would give the arms different map
+     * pointers and split that state in two; a split ahead of these same matchers
+     * is what once put wax_check_sendmsg past the instruction ceiling.
+     *
+     * The fallback is looked up before wax_managed_uids so that a host with none
+     * installed pays one failed lookup here and stops.
+     *
+     * The three copies of this in net_policy.h, file_proc.h and file_cred.h are
+     * deliberately identical down to the wording; only the map name differs. */
+    if (wax_fallback_on && !inner) {
+        __u32 fb = FALLBACK_UID;
+        void *fallback = bpf_map_lookup_elem(&wax_active_policy_by_uid, &fb);
+
+        if (fallback && !bpf_map_lookup_elem(&wax_managed_uids, &uid))
+            inner = fallback;
+    }
     if (!inner) {
+        /* No policy and no fallback. The empty policy id below is what tells
+         * this record apart from one a fallback decided. */
         if (op == OP_EXEC) queue_exec_event(uid, 'S', path, 0, RULE_SLOT_NONE);
         return 0;
     }
