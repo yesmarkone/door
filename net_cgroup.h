@@ -22,18 +22,25 @@ struct cgroup_walk_ctx {
  * RHEL 9.8 (kernel 5.14.0-687) backported the upstream rename of
  * kernfs_node::parent to kernfs_node::__parent. The build-time vmlinux.h only
  * carries one of the two names, so read whichever the running kernel exposes.
+ * Both are declared as CO-RE flavors because bpf_core_field_exists() resolves
+ * at load time and clang still type-checks the dead branch; see file_cgroup.h.
  */
 struct kernfs_node___parent_flavor {
     struct kernfs_node___parent_flavor *__parent;
 } __attribute__((preserve_access_index));
 
+struct kernfs_node___legacy_parent_flavor {
+    struct kernfs_node___legacy_parent_flavor *parent;
+} __attribute__((preserve_access_index));
+
 static __always_inline struct kernfs_node *kernfs_node_parent(struct kernfs_node *kn)
 {
     struct kernfs_node___parent_flavor *k = (void *)kn;
+    struct kernfs_node___legacy_parent_flavor *l = (void *)kn;
 
     if (bpf_core_field_exists(k->__parent))
         return (struct kernfs_node *)BPF_CORE_READ(k, __parent);
-    return BPF_CORE_READ(kn, parent);
+    return (struct kernfs_node *)BPF_CORE_READ(l, parent);
 }
 
 static long cgroup_walk_cb(__u32 i, void *data)

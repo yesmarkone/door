@@ -27,7 +27,7 @@ static __always_inline int check(struct file *file, __u8 op)
         __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
         bpf_map_delete_elem(&wax_pending_execs, &pid);
     }
-    return check_policy(path_scratch->path, (__u32)len - 1, op);
+    return check_policy((__u32)len - 1, op);
 }
 
 /* Resolve "parent directory path" + "/" + "dentry name" into the shared path
@@ -68,7 +68,7 @@ static __always_inline int check_dir_dentry(const struct path *dir,
     /* off + 1 leading bytes plus len - 1 component bytes. This is the one
      * producer that can exceed PATH_LEN, which only suffix rules care about;
      * they decline to match a path they cannot see the end of. */
-    return check_policy(ps->path, off + (__u32)len, op);
+    return check_policy(off + (__u32)len, op);
 }
 
 /* Hooks that receive the target as a struct path resolve it directly. */
@@ -84,7 +84,7 @@ static __always_inline int check_path_op(const struct path *p, __u8 op)
     ps->path[0] = '\0';
     len = bpf_d_path((struct path *)p, ps->path, PATH_LEN);
     if (len <= 0) return 0;
-    return check_policy(ps->path, (__u32)len - 1, op);
+    return check_policy((__u32)len - 1, op);
 }
 
 /* inode_setattr only receives a dentry; the path comes from the d_parent walk
@@ -100,7 +100,7 @@ static __always_inline int check_dentry_op(struct dentry *dentry, __u8 op)
     if (!ps) return 0;
     len = walk_dentry_path(dentry, ps->path, PATH_LEN);
     if (len <= 0) return 0;
-    return check_policy(ps->path, (__u32)len - 1, op);
+    return check_policy((__u32)len - 1, op);
 }
 
 /* Judge an open file whose path cannot come from bpf_d_path, because the hook
@@ -120,7 +120,7 @@ static __always_inline int check_file_walk_op(struct file *file, __u8 op,
     if (!ps) return 0;
     len = walk_file_path(file, ps->path, PATH_LEN);
     if (len <= 0) return 0;
-    return check_policy_walk(ps->path, (__u32)len - 1, op, quiet_s);
+    return check_policy_walk((__u32)len - 1, op, quiet_s);
 }
 
 /*

@@ -223,8 +223,7 @@ long BPF_PROG(wax_check_truncate, const struct path *path)
     return lsm_ret(check_path_op(path, OP_TRUNCATE));
 }
 
-SEC("lsm/inode_setattr")
-long BPF_PROG(wax_check_setattr, struct dentry *dentry, struct iattr *attr)
+static __always_inline int setattr_body(struct dentry *dentry, struct iattr *attr)
 {
     __u32 ia_valid = BPF_CORE_READ(attr, ia_valid);
 
@@ -234,7 +233,60 @@ long BPF_PROG(wax_check_setattr, struct dentry *dentry, struct iattr *attr)
      * double-accounting the same write. */
     if (!(ia_valid & (ATTR_MTIME | ATTR_MTIME_SET)) || (ia_valid & ATTR_SIZE))
         return 0;
-    return lsm_ret(check_dentry_op(dentry, OP_SETTIME));
+    return check_dentry_op(dentry, OP_SETTIME);
+}
+
+/*
+ * TWO PROGRAMS, ONE ATTACH POINT, AND EXACTLY ONE OF THEM IS EVER LOADED.
+ *
+ * security_inode_setattr gained a leading idmap argument upstream in 6.3, so
+ * the same hook carries two different argument layouts across the kernels this
+ * object supports:
+ *
+ *   <= 6.2 (RHEL 9 / 5.14):  (struct dentry *, struct iattr *)
+ *   >= 6.3 (RHEL 10 / 6.12): (struct mnt_idmap *, struct dentry *, struct iattr *)
+ *
+ * This is the one hook in the whole object whose arguments MOVED rather than
+ * merely being renamed or extended, which is why CO-RE cannot repair it: a
+ * field relocation fixes offsets inside a struct, not the position of an
+ * argument in the context array. Declaring the 5.14 layout on 6.12 reads the
+ * idmap as the dentry and the dentry as the iattr — and it does so SILENTLY,
+ * because every access below goes through bpf_probe_read_kernel, which the
+ * verifier has no reason to reject. Measured on 6.12 before this split: the
+ * ia_valid test saw 0x480000 for a utimensat that really carried 0x101f0, so
+ * settime rules simply never matched.
+ *
+ * The one argument that differs is not read by either program — both want the
+ * dentry and the iattr — so the two entry points are a signature apiece over a
+ * shared body, and nothing here has to know which kernel it is on.
+ *
+ * WHICH ONE LOADS IS DECIDED IN USERSPACE, by argument count read from the
+ * running kernel's BTF: see hookProgram.lsmArgs and lsmHookArgs() in
+ * cmd/wdog/hooks.go. Loading the wrong one does not mis-decide, it fails to
+ * verify — the arm that does not match the kernel touches an argument the hook
+ * does not have — so a mistake here is a startup failure and never a quiet hole.
+ *
+ * The alternative was one program branching on bpf_core_type_exists(struct
+ * mnt_idmap), the shape kernfs_node_parent() uses in file_cgroup.h. It was
+ * rejected: that pattern needs the dead arm's ctx[2] access to be pruned before
+ * the verifier's argument-count check sees it, which holds only as long as
+ * clang does not hoist the load above the folded branch. Nothing in the source
+ * states that guarantee. Two programs need no guarantee at all.
+ */
+SEC("lsm/inode_setattr")
+long BPF_PROG(wax_check_setattr, struct dentry *dentry, struct iattr *attr)
+{
+    return lsm_ret(setattr_body(dentry, attr));
+}
+
+/* The 6.3+ layout. idmap is deliberately void *: struct mnt_idmap does not
+ * exist in a 5.14 vmlinux.h, and naming a type the build kernel lacks would
+ * fail the build on exactly the kernels this pair exists to span. */
+SEC("lsm/inode_setattr")
+long BPF_PROG(wax_check_setattr_idmap, void *idmap, struct dentry *dentry,
+             struct iattr *attr)
+{
+    return lsm_ret(setattr_body(dentry, attr));
 }
 
 SEC("tracepoint/sched/sched_process_exec")

@@ -17,8 +17,13 @@ static __always_inline void zero_net_event(struct net_event *e)
         p[i] = 0;
 }
 
+/* upath is the AF_UNIX destination path, or NULL. It is passed rather than read
+ * from t->path because the only caller is check_net_policy, a global subprogram
+ * that may not dereference a pointer stored inside its PTR_TO_MEM argument; see
+ * struct net_check_ctx::upath in door/net_policy.h. */
 static __always_inline void emit_net_event(__u32 uid, __u8 op, __u8 status,
                                            const struct net_target *t,
+                                           const char *upath,
                                            const char *executable_path,
                                            const char *policy_id, __u32 rule_slot)
 {
@@ -75,8 +80,8 @@ static __always_inline void emit_net_event(__u32 uid, __u8 op, __u8 status,
                 e->cmdline_len = cmdline_len;
         }
     }
-    if (t->path)
-        bpf_probe_read_kernel_str(e->path, sizeof(e->path), t->path);
+    if (upath)
+        bpf_probe_read_kernel_str(e->path, sizeof(e->path), upath);
     if (executable_path)
         bpf_probe_read_kernel_str(e->executable_path, sizeof(e->executable_path),
                                   executable_path);

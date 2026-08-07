@@ -20,19 +20,28 @@
 //
 // Three properties, and only the first is about tidiness:
 //
-//  1. ARMING LATENCY. Verifying the file object takes the better part of a
-//     minute, nearly all of it verifier time. Until it finishes, `pkill wdog`
+//  1. ARMING LATENCY. Verifying the other two objects takes long enough to
+//     matter, nearly all of it verifier time. Until it finishes, `pkill wdog`
 //     and `bpftool map delete` both work. This object has no bpf_loop over
 //     policy, no bpf_d_path, no glob matcher and no 1440-byte event, so it loads
-//     and attaches in about a second — and wdog attaches it FIRST. The
-//     undefended window shrinks from ~45s to ~1s, which matters more once a
-//     supervisor is restarting wdog on its own.
+//     and attaches in well under a second — and wdog attaches it FIRST.
+//
+//     The gap is smaller than it was. On 5.14 the file object took the better
+//     part of a minute and the undefended window was ~45s. On 6.12, after
+//     check_policy and check_net_policy became global subprograms (see
+//     door/file_policy.h), it is file 3.7s + net 0.4s against this object's
+//     0.4s. Still worth attaching first, and it matters more once a supervisor
+//     is restarting wdog on its own — but nobody should quote 45 seconds.
 //  2. IT CANNOT BE DESELECTED. fileHooks is a supported way to run on a kernel
 //     missing an attach point (docs/build.md). A hole in the daemon's protection
 //     of itself is not the same kind of thing, so it lives behind a different
 //     option with a different default.
 //  3. VERIFIER BUDGET. wax_check_sendmsg in the network object came close to the
 //     million-instruction ceiling on 5.14. Nothing here can push it closer.
+//     (It has since dropped to 40,106 on 6.12 by becoming a caller of a global
+//     subprogram rather than an inliner of one — but the reason for keeping this
+//     object's programs O(1) on scalars is that it costs nothing to keep, not
+//     that the budget is still tight.)
 //
 // Attach ORDER buys arming latency and nothing else, and it is worth saying so
 // before someone "optimises" it away: BPF LSM programs are attached as

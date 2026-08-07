@@ -224,23 +224,32 @@ static __always_inline int check_policy_impl(const char *path, __u32 path_len,
      * lookup rather than just ahead of the rule loop where it used to be; the
      * origin half is carried down to the loop unchanged.
      *
-     * ⚠ THIS LINE IS THE EXPENSIVE PART OF THE POLICY-KEY CHANGE, AND THE
-     * SECOND LOOKUP BELOW IS NOT. Measured on RHEL 9 (5.14) with
-     * LogLevelStats: wax_check_sendmsg, the program with the least verifier
-     * budget, went from 316,945 to 557,242 instructions against the 1,000,000
-     * ceiling. Deleting the unscoped lookup below and remeasuring gives
-     * 556,936 — the lookup costs ~300. The rest is this call moving up.
-     *
-     * The reason is the shape this file warns about everywhere else: the two
-     * maybe-null map lookups inside current_session_axes fork the verifier
+     * ⚠ THIS LINE WAS ONCE THE EXPENSIVE PART, AND ON 5.14 IT STILL IS.
+     * Measured on RHEL 9 (5.14) with LogLevelStats: wax_check_sendmsg, the
+     * program with the least verifier budget, went from 316,945 to 557,242
+     * instructions against the 1,000,000 ceiling when this call moved up here
+     * from just ahead of the rule loop. Deleting the unscoped lookup below and
+     * remeasuring gave 556,936 — that lookup costs ~300, and the rest was this
+     * line. The reason is the shape this file warns about everywhere else: the
+     * two maybe-null map lookups inside current_session_axes fork the verifier
      * state, and up here that fork sits AHEAD of bpf_d_path and the two glob
-     * matchers instead of just ahead of the rule loop, so everything below is
-     * explored on each path. barrier_var() on both outputs does not collapse
-     * it (measured: no change).
+     * matchers, so everything below is explored on each path. barrier_var() on
+     * both outputs does not collapse it (measured: no change).
      *
-     * 44% headroom is what is left. Before adding anything to these programs,
-     * measure. The retreat if it is ever crossed is --net-hooks dropping
-     * sendmsg, the same lever --fallback-policy=file gives the fallback arm.
+     * ON 6.12 THE FORK IS FREE. Re-measured on 6.12 by stubbing
+     * current_session_axes out to constants and rebuilding: wax_check_sendmsg
+     * went 594,943 -> 594,092, i.e. −851, −0.14%. Six years of state pruning
+     * absorbed what cost a quarter of the budget on 5.14. Do not plan around
+     * this line on 6.12; do keep planning around it on 5.14.
+     *
+     * Headroom is no longer where either number suggests, because
+     * check_net_policy and the two check_policy entry points below are global
+     * subprograms now: wax_check_sendmsg verifies in 40,106 instructions on
+     * 6.12, 4% of the ceiling. Before adding anything to these programs,
+     * measure — on the oldest kernel you support, because that is the one where
+     * the ceiling is reached first. The retreat if it is ever crossed is
+     * --net-hooks dropping sendmsg, the same lever --fallback-policy=file gives
+     * the fallback arm.
      *
      * The runtime cost of moving it up is that a uid with no policy at all now
      * pays the session lookups before finding that out. Only tasks that HAVE a
@@ -297,18 +306,18 @@ static __always_inline int check_policy_impl(const char *path, __u32 path_len,
     if (!inner) {
         /* No policy and no fallback. The empty policy id below is what tells
          * this record apart from one a fallback decided. */
-        if (op == OP_EXEC) queue_exec_event(uid, 'S', path, 0, RULE_SLOT_NONE);
+        if (!walk && op == OP_EXEC) queue_exec_event(uid, 'S', path, 0, RULE_SLOT_NONE);
         return 0;
     }
     meta = bpf_map_lookup_elem(inner, &zero);
     if (!meta) {
-        if (op == OP_EXEC) queue_exec_event(uid, 'S', path, 0, RULE_SLOT_NONE);
+        if (!walk && op == OP_EXEC) queue_exec_event(uid, 'S', path, 0, RULE_SLOT_NONE);
         return 0;
     }
     count = meta->meta.rule_count;
     if (count > MAX_RULES) count = MAX_RULES;
     if (count == 0) {
-        if (op == OP_EXEC)
+        if (!walk && op == OP_EXEC)
             queue_exec_event(uid, 'S', path, meta->meta.id, RULE_SLOT_NONE);
         return 0;
     }
@@ -377,23 +386,65 @@ static __always_inline int check_policy_impl(const char *path, __u32 path_len,
      * any rule.  Allowed matching rules have already queued their own event
      * in check_rule_cb. Nothing decided this one, so it carries no rule slot —
      * which is how such a record is told apart from an allow a rule granted. */
-    if (op == OP_EXEC && !ctx.matched)
+    if (!walk && op == OP_EXEC && !ctx.matched)
         queue_exec_event(uid, 'S', path, meta->meta.id, RULE_SLOT_NONE);
     return ctx.result;
 }
 
+/*
+ * ===========================================================================
+ * THE TWO ENTRY POINTS, AND WHY THEY ARE GLOBAL SUBPROGRAMS (__noinline).
+ * ===========================================================================
+ *
+ * A global subprogram is verified ONCE, standing on its own, and the verifier
+ * does not descend into it at the call site. Everything above therefore costs
+ * each of the eighteen hooks below one flat price instead of a copy of this
+ * function's branching folded into that hook's own. door/net_policy.h carries
+ * the long form of the argument and the measurements that motivated it.
+ *
+ * WHY TWO FUNCTIONS AND NOT ONE WITH A FLAG. Same reason `walk` existed as a
+ * folded literal before: bpf_d_path does not load in lsm/file_permission (still
+ * true on 6.12 — verified, not assumed), and wax_check_readdir attaches there.
+ * A single function taking walk as a runtime argument would carry bpf_d_path on
+ * every path, and readdir's program would be rejected for a call it can never
+ * make. Two functions keep `walk` a literal inside each, so each keeps one arm
+ * and drops the other exactly as before — including the four queue_exec_event()
+ * calls above, which are now guarded on !walk for precisely this reason. Only
+ * the subprograms a program actually calls are loaded with it, so readdir's
+ * program contains the walk form and nothing else.
+ *
+ * NO POINTER ARGUMENTS, DELIBERATELY. Every caller stages its resolved path in
+ * wax_file_path_scratch and did so before this change; these functions look it
+ * up themselves rather than receive it. That keeps both signatures pure scalars
+ * — no PTR_TO_MEM contract, no NULL-check obligation, no pointer-inside-a-struct
+ * hazard — which is the least the verifier can be asked to accept and therefore
+ * the most portable across the kernels this object targets. The path argument
+ * that used to be here said nothing the scratch map did not already fix.
+ *
+ * Reverting is two words: put `static __always_inline` back and pass the path
+ * in again. Nothing above this line depends on the split.
+ */
+
 /* The bpf_d_path form, for every hook that is in sleepable_lsm_hooks — which is
- * all of them but wax_check_readdir. */
-static __always_inline int check_policy(const char *path, __u32 path_len, __u8 op)
+ * all of them but wax_check_readdir. path_len counts the bytes before the NUL of
+ * the path already staged in wax_file_path_scratch. */
+__noinline int check_policy(__u32 path_len, __u8 op)
 {
-    return check_policy_impl(path, path_len, op, 0, 0);
+    __u32 zero = 0;
+    struct file_path_scratch *ps = bpf_map_lookup_elem(&wax_file_path_scratch, &zero);
+
+    if (!ps) return 0;
+    return check_policy_impl(ps->path, path_len, op, 0, 0);
 }
 
 /* The dentry-and-mount-walk form, for hooks where bpf_d_path does not load. */
-static __always_inline int check_policy_walk(const char *path, __u32 path_len,
-                                             __u8 op, __u8 quiet_s)
+__noinline int check_policy_walk(__u32 path_len, __u8 op, __u8 quiet_s)
 {
-    return check_policy_impl(path, path_len, op, 1, quiet_s);
+    __u32 zero = 0;
+    struct file_path_scratch *ps = bpf_map_lookup_elem(&wax_file_path_scratch, &zero);
+
+    if (!ps) return 0;
+    return check_policy_impl(ps->path, path_len, op, 1, quiet_s);
 }
 
 #endif /* DOOR_FILE_POLICY_H */

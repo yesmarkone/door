@@ -4,6 +4,20 @@
 #ifndef DOOR_FILE_MAPS_H
 #define DOOR_FILE_MAPS_H
 
+/*
+ * Not dead code; door/net_maps.h carries the same three lines and the full
+ * explanation. In short: with a global (non-inlined) subprogram in the object —
+ * check_policy and check_policy_walk in door/file_policy.h — clang emits these
+ * slot types into BTF as forward declarations only, and libbpf then cannot size
+ * the inner maps of the map-in-maps below ("can't determine value size for type
+ * [N]: -22"). A global variable of each type forces the layout back out. It is a
+ * toolchain behaviour rather than a kernel one, so an older build host does not
+ * escape it either.
+ */
+struct policy_slot __wax_force_policy_slot_btf;
+struct proc_policy_slot __wax_force_proc_slot_btf;
+struct cred_policy_slot __wax_force_cred_slot_btf;
+
 /* Every inner policy map has this fixed layout: meta then the ordered rules. */
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);

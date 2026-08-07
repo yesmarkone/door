@@ -4,6 +4,28 @@
 #ifndef DOOR_NET_MAPS_H
 #define DOOR_NET_MAPS_H
 
+/*
+ * Not dead code, and deleting it breaks the build in a way that does not look
+ * like this line.
+ *
+ * With a global (non-inlined) subprogram in the object — check_net_policy —
+ * clang stops emitting struct net_policy_slot's layout into the object's BTF
+ * and leaves only a forward declaration. libbpf then cannot size the inner map
+ * of the map-in-map below and refuses the whole object at load:
+ *
+ *   map 'wax_active_net_policy_by_uid.inner': can't determine value size for
+ *   type [1243]: -22
+ *
+ * A global variable of the type forces the full layout back out. It costs eight
+ * bytes of .bss that nothing reads. Isolated by putting `static
+ * __always_inline` back on check_net_policy and watching the FWD turn into a
+ * STRUCT again, so it is the non-inlining that provokes it — a toolchain
+ * behaviour, not a kernel one, which means it does not go away on an older
+ * build host either. door/file_maps.h carries the same line for the same
+ * reason.
+ */
+struct net_policy_slot __wax_force_net_slot_btf;
+
 /* Every inner policy map has this fixed layout: meta then the ordered rules. */
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);

@@ -23,18 +23,29 @@ struct cgroup_walk_ctx {
  * running kernel actually exposes. bpf_core_field_exists() folds the unused
  * branch to a constant the verifier prunes, so the CO-RE relocation for the
  * field that is absent on the target never sits on a live code path.
+ *
+ * Both names are declared here as CO-RE flavors rather than one of them being
+ * read off vmlinux.h's struct directly: bpf_core_field_exists() resolves at
+ * load time, not preprocessing time, so clang still type-checks the dead
+ * branch. Naming the field vmlinux.h happens to lack would fail the build on
+ * exactly the kernels the fallback exists for.
  */
 struct kernfs_node___parent_flavor {
     struct kernfs_node___parent_flavor *__parent;
 } __attribute__((preserve_access_index));
 
+struct kernfs_node___legacy_parent_flavor {
+    struct kernfs_node___legacy_parent_flavor *parent;
+} __attribute__((preserve_access_index));
+
 static __always_inline struct kernfs_node *kernfs_node_parent(struct kernfs_node *kn)
 {
     struct kernfs_node___parent_flavor *k = (void *)kn;
+    struct kernfs_node___legacy_parent_flavor *l = (void *)kn;
 
     if (bpf_core_field_exists(k->__parent))
         return (struct kernfs_node *)BPF_CORE_READ(k, __parent);
-    return BPF_CORE_READ(kn, parent);
+    return (struct kernfs_node *)BPF_CORE_READ(l, parent);
 }
 
 static long cgroup_walk_cb(__u32 i, void *data)

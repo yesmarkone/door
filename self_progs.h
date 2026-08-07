@@ -439,10 +439,29 @@ long BPF_PROG(wax_self_chown, const struct path *path, uid_t uid, gid_t gid)
                                      SELF_NO_WRITE, SOP_WRITE));
 }
 
+/* Two programs for one attach point, exactly one of which is loaded; the long
+ * form of why is on wax_check_setattr in door/file_progs.h. The short form:
+ * security_inode_setattr grew a leading idmap argument in 6.3, the shift is
+ * silent rather than fatal, and on 6.12 the 5.14 declaration guarded a
+ * mnt_idmap instead of a dentry — which for THIS object means the timestamp of
+ * a protected file was not guarded at all. cmd/wdog/hooks.go picks the arm that
+ * matches the running kernel's BTF. */
+static __always_inline int self_setattr_body(struct dentry *dentry)
+{
+    return self_guard_dentry(dentry, SELF_NO_WRITE, SOP_WRITE);
+}
+
 SEC("lsm/inode_setattr")
 long BPF_PROG(wax_self_setattr, struct dentry *dentry, struct iattr *attr)
 {
-    return lsm_ret(self_guard_dentry(dentry, SELF_NO_WRITE, SOP_WRITE));
+    return lsm_ret(self_setattr_body(dentry));
+}
+
+SEC("lsm/inode_setattr")
+long BPF_PROG(wax_self_setattr_idmap, void *idmap, struct dentry *dentry,
+             struct iattr *attr)
+{
+    return lsm_ret(self_setattr_body(dentry));
 }
 
 /* ===========================================================================
