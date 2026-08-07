@@ -14,9 +14,6 @@ struct net_check_ctx {
     const struct net_target *t;
     const char *executable_path;
     const char *policy_id;
-    /* The caller's interned employee id, EMPLOYEE_ID_ANY when unknown.
-     * Resolved once per check rather than per rule. */
-    __u32 employee_id;
     __u32 uid;
     __u32 count;
     __u32 exec_path_len;
@@ -66,9 +63,10 @@ static long check_net_rule_cb(__u32 i, void *data)
     if (!slot || !slot->rule.enabled) return 0;
     r = &slot->rule;
     if (!(r->permission & ctx->perm_bit)) return 0;
-    /* Scalars only, on purpose: see struct rule::employee_id in file.c. */
-    if (r->employee_id != EMPLOYEE_ID_ANY && r->employee_id != ctx->employee_id)
-        return 0;
+    /* No employee test: the caller's person is half the key this policy was
+     * found under. See struct policy_key — getting this compare out of the loop
+     * is what paid for the extra lookup that key costs, and this is the loop
+     * that had the least budget to give. */
     if (r->origin_mask && !(r->origin_mask & ctx->origin_bit)) return 0;
     if (r->family && r->family != t->family) return 0;
     if (r->sock_type && r->sock_type != t->sock_type) return 0;
@@ -138,16 +136,18 @@ static __always_inline int task_is_exempt(void)
 /* Evaluate a resolved socket target against the caller's policy. Policies are
  * selected — and events attributed — by the audit login uid, which pam_loginuid
  * assigns at login and which survives su/sudo, so a user stays under their own
- * policy after switching to root. A rule's employee_name narrows it further to
- * one person on that account — the login uid picks the policy, the name picks
- * which of its rules apply. The first rule whose permission bit and every
- * constraint match decides the outcome. Unlike file.c there is no audit event
- * for the no-rule-matched case; only a matching rule emits. */
+ * policy after switching to root. The employee PAM recorded on that session is
+ * the other half of the selection — one shared account can carry a different
+ * policy per person, and the rules themselves then name nobody. See
+ * struct policy_key. The first rule whose permission bit and every constraint
+ * match decides the outcome. Unlike file.c there is no audit event for the
+ * no-rule-matched case; only a matching rule emits. */
 static __always_inline int check_net_policy(const struct net_target *t, __u8 op,
                                             __u8 perm_bit)
 {
     __u32 uid, zero = 0, count, exec_path_len = 0, employee_id;
     __u8 origin_bit;
+    struct policy_key key;  /* see door/file_policy.h */
     struct task_struct *task;
     struct net_policy_slot *meta;
     struct net_check_ctx ctx;
@@ -160,14 +160,23 @@ static __always_inline int check_net_policy(const struct net_target *t, __u8 op,
 
     task = (struct task_struct *)bpf_get_current_task_btf();
     uid = BPF_CORE_READ(task, loginuid.val);
-    /* The host fallback policy, in the shape door/file_policy.h explains at
-     * length — the reserved-key guard, the managed-uid gate, and why the
-     * fallback shares this outer map rather than getting an array of its own.
-     * Kept identical to that copy on purpose; only the map name differs. */
+    /* The (uid, employee) lookup and the host fallback, in the shape
+     * door/file_policy.h explains at length — the reserved-key guard, the
+     * managed-uid gate, why an employee-scoped policy replaces the unscoped one,
+     * and why all three lookups share this one outer map rather than getting an
+     * array apiece. Kept identical to that copy on purpose; only the map name
+     * differs. */
     if (wax_net_fallback_on && uid == FALLBACK_UID) return 0;
-    inner = bpf_map_lookup_elem(&wax_active_net_policy_by_uid, &uid);
+    current_session_axes(task, uid, &employee_id, &origin_bit);
+    key.uid = uid;
+    key.employee_id = employee_id;
+    inner = bpf_map_lookup_elem(&wax_active_net_policy_by_uid, &key);
+    if (!inner && employee_id != EMPLOYEE_ID_ANY) {
+        key.employee_id = EMPLOYEE_ID_ANY;
+        inner = bpf_map_lookup_elem(&wax_active_net_policy_by_uid, &key);
+    }
     if (wax_net_fallback_on && !inner) {
-        __u32 fb = FALLBACK_UID;
+        struct policy_key fb = { .uid = FALLBACK_UID, .employee_id = EMPLOYEE_ID_ANY };
         void *fallback = bpf_map_lookup_elem(&wax_active_net_policy_by_uid, &fb);
 
         if (fallback && !bpf_map_lookup_elem(&wax_net_managed_uids, &uid))
@@ -200,18 +209,17 @@ static __always_inline int check_net_policy(const struct net_target *t, __u8 op,
         }
     }
 
-    current_session_axes(task, uid, &employee_id, &origin_bit);
     ctx = (struct net_check_ctx){
         .inner = inner,
         .t = t,
         .executable_path = executable_path,
         .policy_id = meta->meta.id,
         .warning = meta->meta.warning,
-        /* Two hash lookups per check, next to the bpf_d_path above that costs
-         * considerably more. Policies with no name-scoped or origin-scoped
-         * rules still pay them, but never consult the result. The origin axis
-         * added no lookup: it comes out of the record already being fetched. */
-        .employee_id = employee_id,
+        /* Carried down from the session lookup that ran before the policy
+         * lookup above — two hash lookups per check, next to the bpf_d_path
+         * that costs considerably more. The employee half selected the policy;
+         * this half is tested per rule, and policies with no origin-scoped
+         * rules pay for it without consulting the result. */
         .origin_bit = origin_bit,
         .uid = uid,
         .count = count,

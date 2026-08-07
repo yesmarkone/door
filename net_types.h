@@ -4,6 +4,20 @@
 #ifndef DOOR_NET_TYPES_H
 #define DOOR_NET_TYPES_H
 
+/* The key wax_active_net_policy_by_uid is looked up by. file.c's struct
+ * policy_key, declared again here because net.c does not include file_types.h —
+ * the same split, and for the same reason, as struct net_policy_meta below.
+ * Both halves and the lookup order are documented there; keep the two
+ * declarations identical. */
+struct policy_key {
+    __u32 uid;
+    __u32 employee_id;
+};
+
+_Static_assert(sizeof(struct policy_key) == 8, "struct policy_key must stay 8 bytes");
+_Static_assert(__builtin_offsetof(struct policy_key, employee_id) == 4,
+               "policy_key.employee_id must stay at offset 4 (cmd/wdog/main.go)");
+
 /* A rule matches when every constraint it sets is satisfied; unset constraints
  * (0 family/protocol/sock_type, NET_ANY_PREFIX, full port range, empty pattern)
  * match anything. Patterns and their wildcard bitmaps carry exactly the same
@@ -18,11 +32,9 @@ struct net_rule {
     char path[PATH_LEN];
     __u8 exec_wild[PATH_LEN / 8];
     __u8 path_wild[PATH_LEN / 8];
-    /* The second user axis, alongside the login uid that selected the policy.
-     * An interned id rather than the name itself — see struct rule in file.c,
-     * where wax_check_sendmsg below is the program that made that necessary.
-     * EMPLOYEE_ID_ANY constrains nobody. */
-    __u32 employee_id;
+    /* No employee field, for the reason struct policy_key above gives: the
+     * person is half the key this policy was looked up by, so a rule restating
+     * it would be dead weight in the loop wax_check_sendmsg cannot afford. */
     __u8 addr[16];
     __u8 enabled;
     __u8 permission;    /* NPERM_* bitmask */
@@ -45,15 +57,18 @@ struct net_rule {
     __u16 port_min;     /* host byte order, inclusive */
     __u16 port_max;
     /* Which session origins this rule covers: a mask of ORIGIN_BIT(ORIGIN_*),
-     * or 0 for "any origin". See struct rule::origin_mask in door/file_types.h.
+     * or 0 for "any origin". See struct rule::origin_mask in door/file_types.h,
+     * including why this axis stayed on the rule when the employee axis did not.
      *
-     * Appended after port_max rather than squeezed in ahead of it. There was no
-     * padding left to take, so either way the struct grows to 616 — and putting
-     * it last is what keeps port_min and port_max where cmd/wdog/net.go already
-     * writes them. */
-    __u8 origin_mask;   /* 612 */
-    __u8 _pad[3];       /* 613 */
-};                      /* 616 */
+     * Appended after port_max rather than squeezed in ahead of it, which is what
+     * keeps port_min and port_max where cmd/wdog/net.go already writes them. */
+    __u8 origin_mask;   /* 608 */
+    /* Three bytes, chosen rather than natural: dropping employee_id left the
+     * struct 2-aligned and 610 bytes long, and a value size that is not a
+     * multiple of four is a needless surprise for a loader that writes every
+     * other slot in 4-byte words. */
+    __u8 _pad[3];       /* 609 */
+};                      /* 612 */
 
 /* Slot 0 of every per-uid net policy. warning is file.c's struct policy_meta
  * field, at the same offset and with the same meaning: the whole policy becomes
@@ -283,21 +298,26 @@ struct net_cgroup_scratch {
 /* The userspace loader writes these two by byte offset (cmd/wdog/net.go) and
  * pins the sizes in net_test.go, so a silent layout change here would corrupt
  * policy and events rather than fail to build. */
-_Static_assert(sizeof(struct net_rule) == 616, "struct net_rule must stay 616 bytes");
+_Static_assert(sizeof(struct net_rule) == 612, "struct net_rule must stay 612 bytes");
 /* sizeof cannot catch two adjacent __u8s swapping places, and deny, no_event_s,
  * warn and no_event_fw are four indistinguishable bytes whose meanings are not
- * interchangeable. Same treatment as file.c's struct rule. no_event_fw took the
- * struct's last padding byte, and origin_mask is what the note there predicted:
- * it grew the struct 612 -> 616. It went on the END so that port_min and
- * port_max, which the loader writes by offset, did not move — pin all four. */
-_Static_assert(__builtin_offsetof(struct net_rule, warn) == 606,
-               "net_rule.warn must stay at offset 606 (cmd/wdog/net.go)");
-_Static_assert(__builtin_offsetof(struct net_rule, no_event_fw) == 607,
-               "net_rule.no_event_fw must stay at offset 607 (cmd/wdog/net.go)");
-_Static_assert(__builtin_offsetof(struct net_rule, port_min) == 608,
-               "net_rule.port_min must stay at offset 608 (cmd/wdog/net.go)");
-_Static_assert(__builtin_offsetof(struct net_rule, origin_mask) == 612,
-               "net_rule.origin_mask must stay at offset 612 (cmd/wdog/net.go)");
+ * interchangeable. Same treatment as file.c's struct rule.
+ *
+ * ⚠ 612 is a size this struct has HELD BEFORE — it is what it was before
+ * origin_mask grew it to 616. Dropping employee_id put it back, so the loader's
+ * value-size check can no longer tell this generation from that one. What tells
+ * them apart is the outer map's KEY size: 4 bytes then, 8 now that a policy is
+ * selected by (uid, employee). checkObjectABI in cmd/wdog/file.go checks both
+ * for exactly this reason, and the same trap sits under struct rule and
+ * struct cred_rule in door/file_types.h. */
+_Static_assert(__builtin_offsetof(struct net_rule, warn) == 602,
+               "net_rule.warn must stay at offset 602 (cmd/wdog/net.go)");
+_Static_assert(__builtin_offsetof(struct net_rule, no_event_fw) == 603,
+               "net_rule.no_event_fw must stay at offset 603 (cmd/wdog/net.go)");
+_Static_assert(__builtin_offsetof(struct net_rule, port_min) == 604,
+               "net_rule.port_min must stay at offset 604 (cmd/wdog/net.go)");
+_Static_assert(__builtin_offsetof(struct net_rule, origin_mask) == 608,
+               "net_rule.origin_mask must stay at offset 608 (cmd/wdog/net.go)");
 _Static_assert(sizeof(struct net_event) == 1472, "struct net_event must stay 1472 bytes");
 _Static_assert(sizeof(struct net_event) % 8 == 0, "zero_net_event needs a multiple of 8");
 /* rule_slot took over a hole that already existed, which is why the 1472 above

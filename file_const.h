@@ -8,8 +8,9 @@
 #define TTY_LEN  64
 #define CMDLINE_LEN 512
 /* Employee names are short human identifiers, not paths; 64 bytes leaves room
- * for a 63-character name plus its NUL. Rules do not store the name — see
- * struct rule::employee_id — but the session record and the intern table do. */
+ * for a 63-character name plus its NUL. Neither rules nor policy keys store the
+ * name — see struct policy_key — but the session record and the intern table
+ * do. */
 #define EMPLOYEE_NAME_LEN 64
 /* The two reporting-only strings on the session record. Neither is ever matched
  * against, in the kernel or out of it — they exist to be printed.
@@ -26,9 +27,10 @@
  * would be a security bug, and this one is a log line. */
 #define SESSION_SERVICE_LEN 32
 #define SESSION_RHOST_LEN   64
-/* A rule that constrains no employee, and the id of a session whose employee
- * is unknown. The two meeting is what makes an unidentified session match only
- * the rules that name nobody. */
+/* The policy that names no employee, and the id of a session whose employee is
+ * unknown. The two meeting is what sends an unidentified session to the uid's
+ * unscoped policy — the same one everybody without a policy of their own gets.
+ * See struct policy_key. */
 #define EMPLOYEE_ID_ANY 0
 
 /* Where a login session came from — the third user axis, after the login uid
@@ -55,7 +57,8 @@
  * the module, a record lost to a reap, a session opened before wdog started —
  * all land here, and a rule constraining origin does not match them. That is
  * the same fail-to-not-match direction current_session_axes() takes for the
- * employee: "deny what cannot be placed" is written as a rule naming
+ * employee, where an unidentified session lands on the unscoped policy rather
+ * than on a named one: "deny what cannot be placed" is written as a rule naming
  * ORIGIN_UNKNOWN, out loud, rather than happening by omission. */
 #define ORIGIN_UNKNOWN   0u  /* not classified; see above — never silently denied */
 #define ORIGIN_REMOTE    1u  /* a person, over the network. sshd */
@@ -325,8 +328,8 @@ static __always_inline __u8 op_perm_mask(__u8 op)
  * already in registers, and status was computed two lines earlier from the same
  * r->deny. It sits at the tail of a bpf_loop callback whose every path then
  * falls into one `return 1`, so the verifier explores nothing twice: unlike the
- * pointer branch struct rule::employee_id describes, this one is BEHIND both
- * glob matchers rather than ahead of them. */
+ * pointer branch struct policy_key describes, this one is BEHIND both glob
+ * matchers rather than ahead of them. */
 static __always_inline int rule_emits(__u8 eff, __u8 no_event_s,
                                       __u8 no_event_fw, __u8 status)
 {

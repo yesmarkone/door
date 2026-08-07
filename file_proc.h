@@ -40,7 +40,8 @@ struct proc_check_ctx {
     __u32 exec_path_len;
     __u32 target_path_len;
     __u32 uid;
-    __u32 employee_id;
+    /* Only the TARGET's employee is carried. The sender's selected the policy
+     * and is spent by the time the loop runs; see struct policy_key. */
     __u32 target_employee_id;
     __u32 target_uid;
     __u32 count;
@@ -50,8 +51,8 @@ struct proc_check_ctx {
     __u8 ptrace_mode;           /* OP_PTRACE: masked to PTRACE_MODE_MASK */
     __u8 matched;
     __u8 warning;               /* see struct policy_check_ctx::warning */
-    /* ORIGIN_BITs of the two sessions, resolved once per check like the two
-     * employee ids beside them. The target's costs a second session lookup —
+    /* ORIGIN_BITs of the two sessions, resolved once per check like the target
+     * employee id beside them. The target's costs a second session lookup —
      * but so did target_employee_id already, and this rides on it. */
     __u8 origin_bit;            /* sender's session */
     __u8 target_origin_bit;     /* target's session */
@@ -93,8 +94,9 @@ static long check_proc_rule_cb(__u32 i, void *data)
     } else if (r->ptrace_mode && !(r->ptrace_mode & ctx->ptrace_mode)) {
         return 0;
     }
-    if (r->employee_id != EMPLOYEE_ID_ANY && r->employee_id != ctx->employee_id)
-        return 0;
+    /* The sender's employee is not tested here — selecting the policy did it.
+     * The target's is, and always will be: it describes the other end of the
+     * call, which changes on every invocation. */
     if (r->target_employee_id != EMPLOYEE_ID_ANY &&
         r->target_employee_id != ctx->target_employee_id)
         return 0;
@@ -146,6 +148,7 @@ static __always_inline int check_proc_policy(struct task_struct *p, __u8 op,
 {
     __u32 uid, zero = 0, count, employee_id, target_eid;
     __u8 origin_bit, target_origin_bit;
+    struct policy_key key;  /* see door/file_policy.h */
     struct task_struct *task;
     struct proc_policy_slot *meta;
     struct proc_check_ctx ctx;
@@ -155,12 +158,20 @@ static __always_inline int check_proc_policy(struct task_struct *p, __u8 op,
     if (task_is_exempt()) return 0;
     task = (struct task_struct *)bpf_get_current_task_btf();
     uid = BPF_CORE_READ(task, loginuid.val);
-    /* The host fallback policy; door/file_policy.h carries the reasoning for all
-     * four copies of this. Kept identical to it apart from the map name. */
+    /* The (uid, employee) lookup and the host fallback; door/file_policy.h
+     * carries the reasoning for all four copies of this. Kept identical to it
+     * apart from the map name. */
     if (wax_fallback_on && uid == FALLBACK_UID) return 0;
-    inner = bpf_map_lookup_elem(&wax_active_proc_policy_by_uid, &uid);
+    current_session_axes(task, uid, &employee_id, &origin_bit);
+    key.uid = uid;
+    key.employee_id = employee_id;
+    inner = bpf_map_lookup_elem(&wax_active_proc_policy_by_uid, &key);
+    if (!inner && employee_id != EMPLOYEE_ID_ANY) {
+        key.employee_id = EMPLOYEE_ID_ANY;
+        inner = bpf_map_lookup_elem(&wax_active_proc_policy_by_uid, &key);
+    }
     if (wax_fallback_on && !inner) {
-        __u32 fb = FALLBACK_UID;
+        struct policy_key fb = { .uid = FALLBACK_UID, .employee_id = EMPLOYEE_ID_ANY };
         void *fallback = bpf_map_lookup_elem(&wax_active_proc_policy_by_uid, &fb);
 
         if (fallback && !bpf_map_lookup_elem(&wax_managed_uids, &uid))
@@ -175,7 +186,8 @@ static __always_inline int check_proc_policy(struct task_struct *p, __u8 op,
 
     self_img = task_image(task);
     target_img = task_image(p);
-    current_session_axes(task, uid, &employee_id, &origin_bit);
+    /* The sender's axes were resolved before the policy lookup — the employee
+     * half was the key. Only the target's is left to do here. */
     target_session_axes(p, &target_eid, &target_origin_bit);
     ctx = (struct proc_check_ctx){
         .inner = inner,
@@ -186,7 +198,6 @@ static __always_inline int check_proc_policy(struct task_struct *p, __u8 op,
         .exec_path_len = self_img ? self_img->path_len : 0,
         .target_path_len = target_img ? target_img->path_len : 0,
         .uid = uid,
-        .employee_id = employee_id,
         .target_employee_id = target_eid,
         .origin_bit = origin_bit,
         .target_origin_bit = target_origin_bit,

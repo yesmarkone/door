@@ -93,8 +93,7 @@ struct cred_check_ctx {
     const char *exec_path;      /* the switching process's image, or NULL */
     const struct cred_id_delta *delta;
     __u32 exec_path_len;
-    __u32 uid;                  /* login uid; the policy key and the event's */
-    __u32 employee_id;
+    __u32 uid;                  /* login uid; half the policy key and the event's */
     __u32 count;
     __u8 op;                    /* OP_SETUID or OP_SETGID */
     __u8 op_bit;                /* the same, as the CRED_OP_*_BIT a rule matches */
@@ -134,13 +133,13 @@ static long check_cred_rule_cb(__u32 i, void *data)
      * first-match-wins meaningful for each operation independently. */
     if (!(r->op_mask & ctx->op_bit)) return 0;
 
-    /* Cheapest first: the destination id is four scalar compares, the employee
-     * one more, and only then the single pattern scan. */
+    /* Cheapest first: the destination id is four scalar compares, the origin
+     * one more, and only then the single pattern scan. The employee is not
+     * among them — selecting the policy already matched it; see
+     * struct policy_key. */
     constrained = ctx->op == OP_SETUID ? r->has_to_uid : r->has_to_gid;
     want = ctx->op == OP_SETUID ? r->to_uid : r->to_gid;
     if (!delta_pick(ctx->delta, constrained, want, &from_id, &to_id)) return 0;
-    if (r->employee_id != EMPLOYEE_ID_ANY && r->employee_id != ctx->employee_id)
-        return 0;
     if (r->origin_mask && !(r->origin_mask & ctx->origin_bit)) return 0;
 
     if (!pattern_is_empty(r->exec_path, r->exec_wild)) {
@@ -176,6 +175,7 @@ static __always_inline int check_cred_policy(const struct cred *new_cred,
                                              __u8 op, __u8 op_bit, int flags)
 {
     __u32 uid, zero = 0, count, employee_id;
+    struct policy_key key;  /* see door/file_policy.h */
     __u8 origin_bit;
     __u32 new_ids[CRED_ID_SLOTS], old_ids[CRED_ID_SLOTS];
     struct cred_id_delta delta;
@@ -223,11 +223,20 @@ static __always_inline int check_cred_policy(const struct cred *new_cred,
      * there is no "from" field because the policy key already IS the source
      * identity. Under the fallback that key is not one uid but "every uid with
      * no policy of its own", so a credRule here reads as "no unmanaged user may
-     * become X" — still a source-scoped rule, just scoped to a set. */
+     * become X" — still a source-scoped rule, just scoped to a set. The
+     * employee half of the key says the same thing about the person, and the
+     * fallback never carries one. */
     if (wax_fallback_on && uid == FALLBACK_UID) return 0;
-    inner = bpf_map_lookup_elem(&wax_active_cred_policy_by_uid, &uid);
+    current_session_axes(task, uid, &employee_id, &origin_bit);
+    key.uid = uid;
+    key.employee_id = employee_id;
+    inner = bpf_map_lookup_elem(&wax_active_cred_policy_by_uid, &key);
+    if (!inner && employee_id != EMPLOYEE_ID_ANY) {
+        key.employee_id = EMPLOYEE_ID_ANY;
+        inner = bpf_map_lookup_elem(&wax_active_cred_policy_by_uid, &key);
+    }
     if (wax_fallback_on && !inner) {
-        __u32 fb = FALLBACK_UID;
+        struct policy_key fb = { .uid = FALLBACK_UID, .employee_id = EMPLOYEE_ID_ANY };
         void *fallback = bpf_map_lookup_elem(&wax_active_cred_policy_by_uid, &fb);
 
         if (fallback && !bpf_map_lookup_elem(&wax_managed_uids, &uid))
@@ -241,7 +250,6 @@ static __always_inline int check_cred_policy(const struct cred *new_cred,
     if (count == 0) return 0;
 
     self_img = task_image(task);
-    current_session_axes(task, uid, &employee_id, &origin_bit);
     ctx = (struct cred_check_ctx){
         .inner = inner,
         .policy_id = meta->meta.id,
@@ -250,7 +258,7 @@ static __always_inline int check_cred_policy(const struct cred *new_cred,
         .delta = &delta,
         .exec_path_len = self_img ? self_img->path_len : 0,
         .uid = uid,
-        .employee_id = employee_id,
+        /* Carried down from the lookup above, where its sibling was the key. */
         .origin_bit = origin_bit,
         .count = count,
         .op = op,

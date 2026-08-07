@@ -4,6 +4,38 @@
 #ifndef DOOR_FILE_TYPES_H
 #define DOOR_FILE_TYPES_H
 
+/* The key every per-uid policy map is looked up by. Both user axes that select
+ * a policy live here: the login uid, and the employee PAM recorded on that
+ * session. EMPLOYEE_ID_ANY (0) is the policy that names nobody — the one
+ * everyone on that uid without a policy of their own falls to, including
+ * sessions whose identity was never recorded.
+ *
+ * The employee is an interned id rather than the name itself, and that is not
+ * an optimization. It is what keeps the lookup a scalar hash of eight bytes
+ * instead of a 64-byte string compare in the path every hook takes. The loader
+ * interns each distinct name and publishes the mapping in wax_employee_ids,
+ * which current_session_axes() consults once per check.
+ *
+ * Two lookups, not an ordered scan: check_policy tries the caller's own
+ * employee first and EMPLOYEE_ID_ANY second. So an employee-scoped policy
+ * REPLACES the uid's unscoped one rather than layering over it, and each policy
+ * has to carry its own catch-all. There is no order among policies — first
+ * match wins applies inside one policy's rule array and nowhere else.
+ *
+ * The rule structs below carry no employee axis at all any more: selecting the
+ * policy IS the employee match. That took a scalar compare out of every rule
+ * loop, which is where this engine's instruction budget is actually spent. The
+ * one exception is proc_rule::target_employee_id, which describes the other end
+ * of a kill or ptrace and cannot be a property of the policy. */
+struct policy_key {
+    __u32 uid;
+    __u32 employee_id;
+};
+
+_Static_assert(sizeof(struct policy_key) == 8, "struct policy_key must stay 8 bytes");
+_Static_assert(__builtin_offsetof(struct policy_key, employee_id) == 4,
+               "policy_key.employee_id must stay at offset 4 (cmd/wdog/main.go)");
+
 /* A rule matches when the current process image matches exec_path, the target
  * matches path, and the rule's permission intersects the mask op_perm_mask()
  * returns for the operation being judged. Patterns are stored
@@ -16,26 +48,13 @@
  * '*', which is what lets the matcher jump straight to the path's tail instead
  * of backtracking. It is 0 for prefix and empty patterns.
  *
- * employee_id is the second user axis, alongside the login uid that selected
- * the policy: it scopes the rule to one person, so one policy on a shared
- * account can be split per employee. EMPLOYEE_ID_ANY means the rule constrains
- * no employee, which is what a rule that names none encodes to.
- *
- * It is an id rather than the name itself, and that is not an optimization —
- * it is what makes the rule loop verifiable. Comparing a name here means
- * branching on a pointer whose null-ness the verifier cannot know, and that
- * fork doubles the exploration of both glob matchers below it; measured on
- * RHEL 9 (5.14), it put wax_check_sendmsg in net.c past the one-million
- * instruction ceiling and the object stopped loading. A scalar compare costs
- * nothing. The loader interns each distinct name to an id and publishes the
- * mapping in wax_employee_ids, which check_policy consults once per check —
- * outside the loop, where one pointer branch is affordable. */
+ * There is no employee field. Who a rule applies to is settled before this
+ * struct is ever read — struct policy_key above says how. */
 struct rule {
     char exec_path[PATH_LEN];
     char path[PATH_LEN];
     __u8 exec_wild[PATH_LEN / 8];
     __u8 path_wild[PATH_LEN / 8];
-    __u32 employee_id;
     __u8 enabled;
     __u8 permission;
     __u8 deny;
@@ -60,37 +79,47 @@ struct rule {
      *
      * A mask rather than a single value so one rule can name "remote or
      * console" — the two human origins — without being written twice. It is a
-     * plain scalar AND in the rule loop for the same reason employee_id is an
-     * interned id: the session lookup that produces the value to test against
-     * happens ONCE per check, outside the loop. See current_session_axes().
+     * plain scalar AND in the rule loop, and affordable there because the
+     * session lookup that produces the value to test against happens ONCE per
+     * check, outside the loop. See current_session_axes().
      *
-     * This byte is what the assert below predicted: struct rule had no padding
-     * left, so it cost four and the map's value size with it. That growth is
-     * the ABI signal working — a wdog carrying this axis cannot silently apply
-     * policy to an object that predates it. See checkObjectABI in
-     * cmd/wdog/file.go. */
+     * This axis stayed on the rule when the employee axis moved to the policy
+     * key, and the asymmetry is deliberate: one person's policy still needs
+     * different rules for different origins ("kim.cs may edit /etc from the
+     * console only"), and splitting that into two policies is impossible when
+     * the key has no origin in it. */
     __u8 origin_mask;
+    /* Padding, and also the size the loader's slot type is written against.
+     * Three bytes is what keeps the struct a multiple of four now that
+     * employee_id — its only multi-byte member — is gone and the natural
+     * alignment is 1. */
     __u8 _pad[3];
 };
 
 /* The userspace loader writes this by byte offset (cmd/wdog/file.go) and
  * file_test.go pins the size, so a silent layout change here would apply policy
  * to the wrong fields rather than fail to build. */
-_Static_assert(sizeof(struct rule) == 592, "struct rule must stay 592 bytes");
+_Static_assert(sizeof(struct rule) == 588, "struct rule must stay 588 bytes");
 /* sizeof alone cannot catch two adjacent __u8s swapping places, and deny,
  * no_event_s, warn and no_event_fw are four indistinguishable bytes whose
  * meanings are not interchangeable. Pin the ones added last.
  *
- * origin_mask is the flag no_event_fw's note predicted: it grew the struct from
- * 588 to 592 and therefore the map's value size, which the loader's Put rejects
- * outright against an older object. Three padding bytes came back with it, so
- * the next flag added here is free again. */
-_Static_assert(__builtin_offsetof(struct rule, warn) == 586,
-               "rule.warn must stay at offset 586 (cmd/wdog/file.go)");
-_Static_assert(__builtin_offsetof(struct rule, no_event_fw) == 587,
-               "rule.no_event_fw must stay at offset 587 (cmd/wdog/file.go)");
-_Static_assert(__builtin_offsetof(struct rule, origin_mask) == 588,
-               "rule.origin_mask must stay at offset 588 (cmd/wdog/file.go)");
+ * ⚠ 588 is a size this struct has HELD BEFORE — it is what it was before
+ * origin_mask grew it to 592. Dropping employee_id put it back, so a value size
+ * of 588 no longer identifies a generation: an object predating the policy-key
+ * change carries rules of exactly this width, and would read the four bytes at
+ * 576 as an employee id while this loader writes enabled/permission/deny/
+ * no_event_s there. What tells the two apart is the OUTER map's key size — 4
+ * bytes when a policy was selected by uid alone, 8 now that it is selected by
+ * (uid, employee). checkObjectABI in cmd/wdog/file.go checks both, and must
+ * keep doing so; the same trap sits under struct cred_rule below and under
+ * struct net_rule in door/net_types.h. */
+_Static_assert(__builtin_offsetof(struct rule, warn) == 582,
+               "rule.warn must stay at offset 582 (cmd/wdog/file.go)");
+_Static_assert(__builtin_offsetof(struct rule, no_event_fw) == 583,
+               "rule.no_event_fw must stay at offset 583 (cmd/wdog/file.go)");
+_Static_assert(__builtin_offsetof(struct rule, origin_mask) == 584,
+               "rule.origin_mask must stay at offset 584 (cmd/wdog/file.go)");
 
 /* A signal rule. Deliberately not struct rule: the thing being acted on is
  * another process, so the constraints describe a task rather than a path.
@@ -112,50 +141,65 @@ struct proc_rule {
     __u8 exec_wild[PATH_LEN / 8];   /* 512 */
     __u8 target_wild[PATH_LEN / 8]; /* 544 */
     __u64 signals;                  /* 576 — OP_KILL only */
-    __u32 employee_id;              /* 584 — sender */
-    __u32 target_employee_id;       /* 588 */
-    __u32 target_uid;               /* 592 — target's real uid */
-    __u8 has_target_uid;            /* 596 — target_uid is meaningful */
-    __u8 enabled;                   /* 597 */
-    __u8 deny;                      /* 598 */
-    __u8 no_event_s;                /* 599 — PROC_OP_* mask: ops with no 'S' */
-    __u8 exec_suffix_len;           /* 600 */
-    __u8 target_suffix_len;         /* 601 */
-    __u8 op_mask;                   /* 602 — PROC_OP_*_BIT; which ops this covers */
-    __u8 ptrace_mode;               /* 603 — OP_PTRACE only; 0 = any mode */
-    __u8 warn;                      /* 604 — this rule alone is observe-only */
-    __u8 no_event_fw;               /* 605 — PROC_OP_* mask: ops with no 'F'/'W' */
+    /* The TARGET's employee, and the only employee id left on any rule. The
+     * sender's moved into struct policy_key, but this one cannot follow it: the
+     * policy is selected by the sender's login uid, while the target is a
+     * different task on every call. "kim.cs may not kill lee.yh's processes but
+     * may kill park.jh's" has to be two rules inside one policy. */
+    __u32 target_employee_id;       /* 584 */
+    __u32 target_uid;               /* 588 — target's real uid */
+    __u8 has_target_uid;            /* 592 — target_uid is meaningful */
+    __u8 enabled;                   /* 593 */
+    __u8 deny;                      /* 594 */
+    __u8 no_event_s;                /* 595 — PROC_OP_* mask: ops with no 'S' */
+    __u8 exec_suffix_len;           /* 596 */
+    __u8 target_suffix_len;         /* 597 */
+    __u8 op_mask;                   /* 598 — PROC_OP_*_BIT; which ops this covers */
+    __u8 ptrace_mode;               /* 599 — OP_PTRACE only; 0 = any mode */
+    __u8 warn;                      /* 600 — this rule alone is observe-only */
+    __u8 no_event_fw;               /* 601 — PROC_OP_* mask: ops with no 'F'/'W' */
     /* ORIGIN_BIT masks, 0 for "any origin". Two of them because this struct is
      * the one with a target axis: the sender's session origin and the target's
      * are independent questions, and "a scheduled job may not signal a remote
      * user's process" needs both halves. See struct rule::origin_mask. */
-    __u8 origin_mask;               /* 606 — sender's session */
-    __u8 target_origin_mask;        /* 607 — target's session */
+    __u8 origin_mask;               /* 602 — sender's session */
+    __u8 target_origin_mask;        /* 603 — target's session */
+    /* Four bytes of tail padding, back again: __u64 signals holds the struct's
+     * alignment at 8, so dropping the sender's employee_id freed four bytes
+     * that the size cannot give up. Read the warning under the size assert
+     * before spending them. */
+    __u8 _pad[4];                   /* 604 */
 };                                  /* 608 */
 
-/* The two bytes came out of the tail padding, so the process controls did not
- * move a single field of the file rule they were modelled on. warn later came
- * out of the same padding, on the same terms, and no_event_fw after it — and
- * the two origin masks have now spent what was left. The struct is exactly
- * full at the same size it has always had, so unlike struct rule it crossed
- * this axis without touching its map's value size. */
+/* ⚠ This is the one rule struct whose size did NOT change when the employee
+ * axis moved to the policy key: __u64 signals pins the alignment at 8, so the
+ * four bytes came back as padding. checkObjectABI therefore cannot tell a
+ * current wdog from a stale libwdoorf.lsm by this map's value size alone — the
+ * asserts below and the sibling structs in the same object (struct rule 592 ->
+ * 588, struct cred_rule 312 -> 308) are what catch it. Exactly the failure mode
+ * struct rule's note calls out: sizeof cannot see fields move within a struct
+ * that stayed the same size. */
 _Static_assert(sizeof(struct proc_rule) == 608, "struct proc_rule must stay 608 bytes");
-_Static_assert(__builtin_offsetof(struct proc_rule, warn) == 604,
-               "proc_rule.warn must stay at offset 604 (cmd/wdog/file.go)");
-_Static_assert(__builtin_offsetof(struct proc_rule, no_event_fw) == 605,
-               "proc_rule.no_event_fw must stay at offset 605 (cmd/wdog/file.go)");
-_Static_assert(__builtin_offsetof(struct proc_rule, origin_mask) == 606,
-               "proc_rule.origin_mask must stay at offset 606 (cmd/wdog/file.go)");
-_Static_assert(__builtin_offsetof(struct proc_rule, target_origin_mask) == 607,
-               "proc_rule.target_origin_mask must stay at offset 607 (cmd/wdog/file.go)");
+_Static_assert(__builtin_offsetof(struct proc_rule, target_employee_id) == 584,
+               "proc_rule.target_employee_id must stay at offset 584 (cmd/wdog/file.go)");
+_Static_assert(__builtin_offsetof(struct proc_rule, warn) == 600,
+               "proc_rule.warn must stay at offset 600 (cmd/wdog/file.go)");
+_Static_assert(__builtin_offsetof(struct proc_rule, no_event_fw) == 601,
+               "proc_rule.no_event_fw must stay at offset 601 (cmd/wdog/file.go)");
+_Static_assert(__builtin_offsetof(struct proc_rule, origin_mask) == 602,
+               "proc_rule.origin_mask must stay at offset 602 (cmd/wdog/file.go)");
+_Static_assert(__builtin_offsetof(struct proc_rule, target_origin_mask) == 603,
+               "proc_rule.target_origin_mask must stay at offset 603 (cmd/wdog/file.go)");
 
 /* A credential-switch rule: the task changing its OWN user or group identity,
  * which is what su and sudo do once they are running.
  *
  * There is deliberately no "from" field. The source identity is the audit login
- * uid, and that is already the key wax_active_cred_policy_by_uid was looked up by —
- * a from_uid would either restate it or be dead. Read a rule as "the login uid
- * this policy belongs to may not acquire to_uid".
+ * uid, and that is already part of the key wax_active_cred_policy_by_uid was
+ * looked up by — a from_uid would either restate it or be dead. Read a rule as
+ * "the login uid this policy belongs to may not acquire to_uid". The employee
+ * half of that key says the same thing about the person: the actor axis is
+ * always what selects the policy, never what a rule carries.
  *
  * The momentary real uid is not a usable source axis either: sudo runs a
  * permission state machine, and after its first hop old->uid is 0 for the rest
@@ -177,18 +221,17 @@ _Static_assert(__builtin_offsetof(struct proc_rule, target_origin_mask) == 607,
 struct cred_rule {
     char exec_path[PATH_LEN];       /*   0 — the switching process's image */
     __u8 exec_wild[PATH_LEN / 8];   /* 256 */
-    __u32 employee_id;              /* 288 */
-    __u32 to_uid;                   /* 292 — OP_SETUID only */
-    __u32 to_gid;                   /* 296 — OP_SETGID only */
-    __u8 has_to_uid;                /* 300 — to_uid is meaningful */
-    __u8 has_to_gid;                /* 301 — to_gid is meaningful */
-    __u8 op_mask;                   /* 302 — CRED_OP_*_BIT; which ops this covers */
-    __u8 enabled;                   /* 303 */
-    __u8 deny;                      /* 304 */
-    __u8 no_event_s;                /* 305 — CRED_OP_* mask: ops with no 'S' */
-    __u8 exec_suffix_len;           /* 306 */
-    __u8 warn;                      /* 307 — this rule alone is observe-only */
-    __u8 no_event_fw;               /* 308 — CRED_OP_* mask: ops with no 'F'/'W' */
+    __u32 to_uid;                   /* 288 — OP_SETUID only */
+    __u32 to_gid;                   /* 292 — OP_SETGID only */
+    __u8 has_to_uid;                /* 296 — to_uid is meaningful */
+    __u8 has_to_gid;                /* 297 — to_gid is meaningful */
+    __u8 op_mask;                   /* 298 — CRED_OP_*_BIT; which ops this covers */
+    __u8 enabled;                   /* 299 */
+    __u8 deny;                      /* 300 */
+    __u8 no_event_s;                /* 301 — CRED_OP_* mask: ops with no 'S' */
+    __u8 exec_suffix_len;           /* 302 */
+    __u8 warn;                      /* 303 — this rule alone is observe-only */
+    __u8 no_event_fw;               /* 304 — CRED_OP_* mask: ops with no 'F'/'W' */
     /* ORIGIN_BIT mask, 0 for "any origin". See struct rule::origin_mask.
      *
      * Read this one twice before writing a rule with it. The login descent is
@@ -196,27 +239,24 @@ struct cred_rule {
      * has given them that user's session — so an origin-scoped deny in credRules
      * locks out exactly the kind of login it names. docs/rules-process.md carries
      * the warning in full. */
-    __u8 origin_mask;               /* 309 */
-    __u8 _pad[2];                   /* 310 */
-};                                  /* 312 */
+    __u8 origin_mask;               /* 305 */
+    __u8 _pad[2];                   /* 306 */
+};                                  /* 308 */
 
-/* warn took what had been the last padding byte, and no_event_fw is the field
- * the comment there predicted: 308 was 4·77 and employee_id forces 4-byte
- * alignment, so one more byte cost four and grew the map's value size.
+/* to_uid and to_gid keep the alignment at 4, so the two trailing padding bytes
+ * are still the last free ones.
  *
- * That growth is the design working, not a cost worked around. It is the only
- * observable signal that a wdog carrying per-operation noEvent is talking to a
- * BPF object that predates it — the other four rule structs kept their sizes —
- * and the loader turns it into a refusal to start rather than a policy applied
- * against bytes the kernel reads as something else. See checkObjectABI in
- * cmd/wdog/file.go. */
-_Static_assert(sizeof(struct cred_rule) == 312, "struct cred_rule must stay 312 bytes");
-_Static_assert(__builtin_offsetof(struct cred_rule, warn) == 307,
-               "cred_rule.warn must stay at offset 307 (cmd/wdog/file.go)");
-_Static_assert(__builtin_offsetof(struct cred_rule, no_event_fw) == 308,
-               "cred_rule.no_event_fw must stay at offset 308 (cmd/wdog/file.go)");
-_Static_assert(__builtin_offsetof(struct cred_rule, origin_mask) == 309,
-               "cred_rule.origin_mask must stay at offset 309 (cmd/wdog/file.go)");
+ * ⚠ 308 is a size this struct has HELD BEFORE — it is what it was before
+ * no_event_fw cost four bytes and grew it to 312. Read struct rule's note
+ * above: the value size no longer identifies a generation, and the outer map's
+ * 8-byte key is what does. */
+_Static_assert(sizeof(struct cred_rule) == 308, "struct cred_rule must stay 308 bytes");
+_Static_assert(__builtin_offsetof(struct cred_rule, warn) == 303,
+               "cred_rule.warn must stay at offset 303 (cmd/wdog/file.go)");
+_Static_assert(__builtin_offsetof(struct cred_rule, no_event_fw) == 304,
+               "cred_rule.no_event_fw must stay at offset 304 (cmd/wdog/file.go)");
+_Static_assert(__builtin_offsetof(struct cred_rule, origin_mask) == 305,
+               "cred_rule.origin_mask must stay at offset 305 (cmd/wdog/file.go)");
 
 /* Slot 0 of every inner policy map. warning makes the whole policy
  * observe-only: its deny rules are allowed through and reported 'W' instead of

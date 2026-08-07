@@ -116,35 +116,38 @@ static __always_inline int match_path_pattern(const char *pattern, const __u8 *w
     return ctx.matched;
 }
 
-/* Resolve this task's audit session to the two axes its rules are written
- * against: the employee id (session -> name, what PAM recorded -> id, what the
- * loader interned) and the origin bit (session -> where the login came from).
+/* Resolve this task's audit session to the two axes policy is written against:
+ * the employee id (session -> name, what PAM recorded -> id, what the loader
+ * interned) and the origin bit (session -> where the login came from).
  *
  * Both come out of ONE record and therefore one map lookup, which is the reason
  * they are resolved together rather than by a function each. The employee
  * lookup was already here; origin rides along on it for free.
  *
+ * The two are spent in different places. The employee id is half the key the
+ * policy itself is looked up by (struct policy_key); the origin bit is tested
+ * per rule inside the loop.
+ *
  * EMPLOYEE_ID_ANY and ORIGIN_UNKNOWN come back whenever that chain breaks, and
  * every break is an ordinary state rather than a failure: no PAM module
- * installed in this stack, no name configured for the login, or a name no rule
- * mentions. Since a rule scoped to an employee carries a non-zero id and a rule
- * scoped to an origin carries a mask that does not include the unknown bit,
- * such a session matches only the rules that constrain neither — deny rules
- * included. Failing closed instead would deny every unclassifiable session
- * everything any scoped deny rule mentions, which is most of the machine.
- * "Deny whoever is not identified" and "deny whatever cannot be placed" are
- * written as trailing catch-all deny rules, which first-match-wins reaches once
- * the scoped rules above them have missed.
+ * installed in this stack, no name configured for the login, or a name no policy
+ * mentions. Such a session lands on the uid's unscoped policy — the one everyone
+ * without a policy of their own gets — and inside it matches only the rules that
+ * constrain no origin, deny rules included. Failing closed instead would deny
+ * every unclassifiable session everything any scoped deny rule mentions, which
+ * is most of the machine. "Deny whoever is not identified" is written as the
+ * unscoped policy's own rules, and "deny whatever cannot be placed" as a rule
+ * naming ORIGIN_UNKNOWN.
  *
- * That matters more for origin than it did for the employee, because origin is
+ * That matters more for origin than it does for the employee, because origin is
  * the axis an operator rolls out gradually: until pam_wood.so is in EVERY
  * session stack, some perfectly ordinary sessions are unknown, and the failure
  * direction here is what keeps that half-finished state from denying them
  * everything.
  *
- * Called once per check, before the rule loop. That placement is deliberate:
- * everything here branches on pointers, and doing any of it per rule is what
- * exhausts the verifier — see struct rule::employee_id. */
+ * Called once per check, ahead of the policy lookup. That placement is
+ * deliberate: everything here branches on pointers, and doing any of it per rule
+ * is what exhausts the verifier — see struct policy_key. */
 static __always_inline void current_session_axes(struct task_struct *task,
                                                  __u32 login_uid,
                                                  __u32 *employee_id,

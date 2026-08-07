@@ -9,9 +9,6 @@ struct policy_check_ctx {
     const char *path;
     const char *executable_path;
     const char *policy_id;
-    /* The caller's interned employee id, EMPLOYEE_ID_ANY when unknown.
-     * Resolved once per check rather than per rule; see current_session_axes. */
-    __u32 employee_id;
     __u32 uid;
     __u32 count;
     /* strlen of the two paths, for suffix matching. A value >= PATH_LEN means
@@ -25,8 +22,9 @@ struct policy_check_ctx {
     __u8 perm_mask;
     __u8 matched;
     __u8 exec_resolved; /* current process image was resolved via bpf_d_path */
-    /* ORIGIN_BIT of the caller's session, from the same lookup and on the same
-     * terms as employee_id above. Exactly one bit is set, always — an
+    /* ORIGIN_BIT of the caller's session, resolved once per check rather than
+     * per rule — current_session_axes hands it back alongside the employee id
+     * that selected this policy. Exactly one bit is set, always: an
      * unclassifiable session carries ORIGIN_BIT(ORIGIN_UNKNOWN) rather than
      * zero, so the test in check_rule_cb needs no special case for it. */
     __u8 origin_bit;
@@ -74,11 +72,13 @@ static __always_inline long check_rule_body(__u32 i, void *data, __u8 can_exec)
     /* An intersection: the rule governs this operation if it carries any of the
      * bits the operation demands. */
     if (!(r->permission & ctx->perm_mask)) return 0;
-    /* Scalars only, on purpose: see struct rule::employee_id. An unidentified
-     * caller has EMPLOYEE_ID_ANY, so a rule scoped to anyone cannot match it. */
-    if (r->employee_id != EMPLOYEE_ID_ANY && r->employee_id != ctx->employee_id)
-        return 0;
-    /* The third user axis, and the cheapest of the three: one AND against a
+    /* No employee test here. The caller's person is half the key this policy was
+     * found under, so by the time the loop runs it has already matched; see
+     * struct policy_key. The compare that used to sit on this line was paid once
+     * per rule per check, and getting it out of the loop is what bought the
+     * budget for the extra lookup that key costs.
+     *
+     * The only user axis left in the loop is the origin below: one AND against a
      * mask both sides already hold. A rule constraining no origin carries 0 and
      * skips out on the first test, which is what every rule written before this
      * axis existed does. */
@@ -162,13 +162,15 @@ static __always_inline int task_is_exempt(void)
  * delete(8) for unlink, rmdir and the source side of a rename;
  * write(4)|delete(8) for the destination side of a rename; write(4) for every
  * other filesystem change (write, truncate, chmod, chown, settime, mkdir,
- * symlink, link, mknod). The first rule whose permission mask, employee_id,
- * exec_path pattern (current process image) and path pattern all match decides
- * the outcome.
+ * symlink, link, mknod). The first rule whose permission mask, exec_path
+ * pattern (current process image) and path pattern all match decides the
+ * outcome.
  *
- * The employee is the second user axis: the login uid picks the policy, the
- * employee picks which of its rules apply. That is what makes a shared account —
- * one uid, many people — controllable per person.
+ * The employee is the second user axis, and it is spent before the first rule
+ * is read: the login uid and the person PAM recorded together pick the policy.
+ * That is what makes a shared account — one uid, many people — controllable per
+ * person, and it means a policy's rules never have to name anyone. See
+ * struct policy_key.
  *
  * `walk` selects how the current process image is resolved, and exists only
  * because hooks that are not in sleepable_lsm_hooks cannot call bpf_d_path — see
@@ -195,6 +197,10 @@ static __always_inline int check_policy_impl(const char *path, __u32 path_len,
 {
     __u32 uid, zero = 0, count, exec_path_len = 0, employee_id;
     __u8 origin_bit;
+    /* Assigned field by field below rather than left to a partial initializer:
+     * this is a hash key, compared as eight raw bytes, so every byte of it has
+     * to be one we put there. */
+    struct policy_key key;
     struct task_struct *task;
     struct policy_slot *meta;
     struct policy_check_ctx ctx;
@@ -213,20 +219,68 @@ static __always_inline int check_policy_impl(const char *path, __u32 path_len,
      * hand it the fallback policy instead of waving it through. Two instructions
      * to make the invariant local rather than a property of eleven call sites. */
     if (wax_fallback_on && uid == FALLBACK_UID) return 0;
-    inner = bpf_map_lookup_elem(&wax_active_policy_by_uid, &uid);
+    /* Both user axes come out of one session record, and the employee half is
+     * needed HERE — it is half the key. That is why this sits ahead of the
+     * lookup rather than just ahead of the rule loop where it used to be; the
+     * origin half is carried down to the loop unchanged.
+     *
+     * ⚠ THIS LINE IS THE EXPENSIVE PART OF THE POLICY-KEY CHANGE, AND THE
+     * SECOND LOOKUP BELOW IS NOT. Measured on RHEL 9 (5.14) with
+     * LogLevelStats: wax_check_sendmsg, the program with the least verifier
+     * budget, went from 316,945 to 557,242 instructions against the 1,000,000
+     * ceiling. Deleting the unscoped lookup below and remeasuring gives
+     * 556,936 — the lookup costs ~300. The rest is this call moving up.
+     *
+     * The reason is the shape this file warns about everywhere else: the two
+     * maybe-null map lookups inside current_session_axes fork the verifier
+     * state, and up here that fork sits AHEAD of bpf_d_path and the two glob
+     * matchers instead of just ahead of the rule loop, so everything below is
+     * explored on each path. barrier_var() on both outputs does not collapse
+     * it (measured: no change).
+     *
+     * 44% headroom is what is left. Before adding anything to these programs,
+     * measure. The retreat if it is ever crossed is --net-hooks dropping
+     * sendmsg, the same lever --fallback-policy=file gives the fallback arm.
+     *
+     * The runtime cost of moving it up is that a uid with no policy at all now
+     * pays the session lookups before finding that out. Only tasks that HAVE a
+     * login uid reach this line — task_is_exempt() turned the others away — so
+     * the population paying it is logged-in sessions, which is the population
+     * that was paying it already whenever a policy existed. */
+    current_session_axes(task, uid, &employee_id, &origin_bit);
+    key.uid = uid;
+    key.employee_id = employee_id;
+    inner = bpf_map_lookup_elem(&wax_active_policy_by_uid, &key);
+    /* No policy naming this person: the uid's unscoped policy takes them. This
+     * is a REPLACEMENT and not a fallthrough — when the first lookup hits, the
+     * unscoped policy is never consulted, so each policy carries its own
+     * catch-all. See struct policy_key.
+     *
+     * Skipped when the session's employee is EMPLOYEE_ID_ANY, because then the
+     * key above already was the unscoped one and this would repeat it. Hosts
+     * where pam_wood.so is not yet everywhere are mostly that case. */
+    if (!inner && employee_id != EMPLOYEE_ID_ANY) {
+        key.employee_id = EMPLOYEE_ID_ANY;
+        inner = bpf_map_lookup_elem(&wax_active_policy_by_uid, &key);
+    }
     /* No policy of this user's own, and none anywhere for this uid: the host
      * fallback decides. A uid WITH a policy never reaches the fallback, not even
      * for the rule kinds its own policy leaves empty — wax_managed_uids is what
      * tells "unmanaged" apart from "managed, no rules of this kind", and
-     * door/file_maps.h says why the difference matters.
+     * door/file_maps.h says why the difference matters. That map stays keyed by
+     * uid alone: a uid whose only policies name individual employees is still
+     * managed, and an unnamed session on it gets that uid's own default rather
+     * than the host net meant for uids nobody enumerated.
      *
      * The fallback lives in the SAME outer map under a reserved key on purpose.
-     * Both lookups then carry that map's one inner_map_meta, so the verifier
-     * types the two arms identically and merges them, and the rule loop below —
-     * with its two nested glob matchers — is explored once. A separate global
-     * array, the shape check_ingress uses, would give the arms different map
-     * pointers and split that state in two; a split ahead of these same matchers
-     * is what once put wax_check_sendmsg past the instruction ceiling.
+     * All three lookups then carry that map's one inner_map_meta, so the
+     * verifier types the arms identically and merges them, and the rule loop
+     * below — with its two nested glob matchers — is explored once. A separate
+     * global array, the shape check_ingress uses, would give the arms different
+     * map pointers and split that state in two; a split ahead of these same
+     * matchers is what once put wax_check_sendmsg past the instruction ceiling.
+     * It is also why the employee lookup above had to go in this map and not a
+     * second one.
      *
      * The fallback is looked up before wax_managed_uids so that a host with none
      * installed pays one failed lookup here and stops.
@@ -234,7 +288,7 @@ static __always_inline int check_policy_impl(const char *path, __u32 path_len,
      * The three copies of this in net_policy.h, file_proc.h and file_cred.h are
      * deliberately identical down to the wording; only the map name differs. */
     if (wax_fallback_on && !inner) {
-        __u32 fb = FALLBACK_UID;
+        struct policy_key fb = { .uid = FALLBACK_UID, .employee_id = EMPLOYEE_ID_ANY };
         void *fallback = bpf_map_lookup_elem(&wax_active_policy_by_uid, &fb);
 
         if (fallback && !bpf_map_lookup_elem(&wax_managed_uids, &uid))
@@ -290,19 +344,17 @@ static __always_inline int check_policy_impl(const char *path, __u32 path_len,
         }
     }
 
-    current_session_axes(task, uid, &employee_id, &origin_bit);
     ctx = (struct policy_check_ctx){
         .inner = inner,
         .path = path,
         .executable_path = executable_path,
         .policy_id = meta->meta.id,
         .warning = meta->meta.warning,
-        /* Two hash lookups per check, next to the bpf_d_path above that costs
-         * considerably more. Policies with no name-scoped or origin-scoped
-         * rules still pay them, but never consult the result. Note that adding
-         * the origin axis added no lookup: both axes come out of the one
-         * session record the employee lookup was already fetching. */
-        .employee_id = employee_id,
+        /* Carried down from the session lookup that ran before the policy
+         * lookup above, which is the same two hash lookups this check has
+         * always paid — the employee half selected the policy and the origin
+         * half is tested per rule. Policies with no origin-scoped rules still
+         * pay for it but never consult the result. */
         .origin_bit = origin_bit,
         .uid = uid,
         .count = count,

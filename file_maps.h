@@ -12,10 +12,20 @@ struct {
     __type(value, struct policy_slot);
 } wax_policy_template SEC(".maps");
 
+/* Keyed by (login uid, employee id), not by uid alone: one shared account can
+ * carry a different policy per person. See struct policy_key in file_types.h
+ * for the lookup order and what it means that an employee-scoped policy
+ * replaces the unscoped one instead of layering over it.
+ *
+ * The name still says by_uid. It is the pin name, the Go constant, the string
+ * in the SELinux module and in half the documentation; renaming it would cost
+ * all of that to say something the key type already says. */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
-    __uint(max_entries, 4096);
-    __type(key, __u32);
+    /* Entries are (uid, person) pairs now, not uids, so the old 4096 would be
+     * spent by a few hundred shared accounts. */
+    __uint(max_entries, 16384);
+    __type(key, struct policy_key);
     __array(values, typeof(wax_policy_template));
 } wax_active_policy_by_uid SEC(".maps");
 
@@ -31,8 +41,8 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
-    __uint(max_entries, 4096);
-    __type(key, __u32);
+    __uint(max_entries, 16384);
+    __type(key, struct policy_key);  /* see wax_active_policy_by_uid */
     __array(values, typeof(wax_proc_policy_template));
 } wax_active_proc_policy_by_uid SEC(".maps");
 
@@ -48,13 +58,20 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
-    __uint(max_entries, 4096);
-    __type(key, __u32);
+    __uint(max_entries, 16384);
+    __type(key, struct policy_key);  /* see wax_active_policy_by_uid */
     __array(values, typeof(wax_cred_policy_template));
 } wax_active_cred_policy_by_uid SEC(".maps");
 
 /* The login uids that have a policy of their own — the set the host fallback
  * policy at FALLBACK_UID does NOT cover.
+ *
+ * Keyed by uid alone, deliberately, while the policy maps above are keyed by
+ * (uid, employee). The question here is "does this uid have any policy at all",
+ * and it has to stay that: a uid whose only policies name individual employees
+ * is still a managed uid, and the person who logs in unnamed must get that
+ * uid's own default — allow, or whatever its unscoped policy says — rather than
+ * the host fallback meant for uids nobody enumerated.
  *
  * It exists because "no inner map" does not mean "no policy" for three of the
  * four spaces. wdog creates a proc, cred or net inner map only when the policy

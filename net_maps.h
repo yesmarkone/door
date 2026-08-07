@@ -12,10 +12,12 @@ struct {
     __type(value, struct net_policy_slot);
 } wax_net_policy_template SEC(".maps");
 
+/* Keyed by (login uid, employee id); see wax_active_policy_by_uid in
+ * door/file_maps.h and struct policy_key for the lookup order. */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
-    __uint(max_entries, 4096);
-    __type(key, __u32);
+    __uint(max_entries, 16384);
+    __type(key, struct policy_key);
     __array(values, typeof(wax_net_policy_template));
 } wax_active_net_policy_by_uid SEC(".maps");
 
@@ -39,7 +41,10 @@ struct {
  * why the value is a presence flag and must never become a per-space bitmask. */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 4096);  /* KEEP IN SYNC with door/file_maps.h */
+    /* KEEP IN SYNC with wax_managed_uids in door/file_maps.h — that map, not the
+     * policy maps. Those are keyed by (uid, employee) and bounded at 16384; this
+     * one is keyed by uid alone and has no reason to follow them. */
+    __uint(max_entries, 4096);
     __type(key, __u32);         /* login uid */
     __type(value, __u8);
 } wax_net_managed_uids SEC(".maps");
